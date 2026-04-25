@@ -39,6 +39,23 @@ ITEMS = {
         "color": (180, 40, 80),
         "description": "Plump wild berries. Restores 15 hunger.",
     },
+    "wheat": {
+        "name": "Wheat",
+        "type": ITEM_RESOURCE,
+        "stack": 40,
+        "value": 3,
+        "color": (214, 186, 86),
+        "description": "Golden grain harvested from village fields.",
+    },
+    "bread": {
+        "name": "Bread",
+        "type": ITEM_FOOD,
+        "stack": 16,
+        "value": 9,
+        "food_restore": 35,
+        "color": (196, 148, 78),
+        "description": "Fresh baked bread. Restores 35 hunger.",
+    },
     "mushroom": {
         "name": "Mushroom",
         "type": ITEM_FOOD,
@@ -334,6 +351,15 @@ ITEMS = {
         "color": (160, 60, 100),
         "description": "Plant on grass to grow a bush.",
     },
+    "wheat_seed": {
+        "name": "Wheat Seed",
+        "type": ITEM_SEED,
+        "stack": 24,
+        "value": 3,
+        "plant_type": "wheat_crop",
+        "color": (220, 196, 104),
+        "description": "Plant on farmland to grow wheat.",
+    },
     "campfire": {
         "name": "Campfire",
         "type": ITEM_MATERIAL,
@@ -410,6 +436,11 @@ LOOT_TABLES = {
         ("berry", 2, 5, 1.0),
         ("fiber", 1, 2, 0.6),
         ("berry_seed", 1, 2, 0.35),
+    ],
+    "wheat_crop": [
+        ("wheat", 2, 4, 1.0),
+        ("wheat_seed", 1, 2, 0.7),
+        ("fiber", 1, 2, 0.25),
     ],
     "mushroom_cluster": [
         ("mushroom", 2, 4, 1.0),
@@ -598,5 +629,11 @@ RECIPES = {
         "ingredients": {"berry": 3},
         "station": None,
         "name": "Berry Seeds",
+    },
+    "bread": {
+        "result_qty": 1,
+        "ingredients": {"wheat": 3},
+        "station": None,
+        "name": "Bread",
     },
 }

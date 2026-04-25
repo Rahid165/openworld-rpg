@@ -58,19 +58,31 @@ class Game:
         self.craft_output_rect = None
         self.inventory_panel_rect = None
         self.hover_stack = None
+        self.open_container_entity = None
+        self.container_panel_rect = None
         self.selected_item_label = ""
         self.selected_item_label_timer = 0.0
         self.last_seed = random.randint(1000, 999999)
         self.time_of_day = 0.30
         self.day_cycle_speed = 1 / 240.0
         self.zombie_spawn_timer = 4.0
+        self.instant_interact_cooldown = 0.0
         self.trade_interact_cooldown = 0.0
+        self.trade_popups = []
+        self.recipe_scroll_offset = 0
         self.villages = []
         self._frame_cache_token = 0
+        self._cached_all_entities = []
         self._cached_npcs = []
         self._cached_combatants = []
+        self._cached_combatants_by_tag = {}
+        self._cached_structure_entities = []
+        self._cached_openable_doors = []
+        self._cached_drops = []
+        self._cached_interactables = []
         self._cached_solid_structure_colliders = []
         self._cached_solid_structure_rects = []
+        self._structure_cache_dirty = True
         self.npc_profiles = self._build_npc_profiles()
 
         self.tilemap = self._create_world()
@@ -119,8 +131,8 @@ class Game:
                 "attack_range": 26,
                 "label": "Farmer",
                 "role": "farmer",
-                "stock": {"berry": 6, "berry_seed": 4, "fiber": 4, "wood": 2, "hoe_wood": 1},
-                "trade_offer": "2 wood -> 4 berries / 1 stone -> berry seeds",
+                "stock": {"berry_seed": 4, "wheat_seed": 6, "hoe_wood": 1, "wood": 2},
+                "trade_offer": "2 wood -> 4 berries / 1 stone -> mixed village seeds",
             },
             "villager_crafter": {
                 "color": (110, 145, 185),
@@ -130,8 +142,8 @@ class Game:
                 "attack_range": 26,
                 "label": "Crafter",
                 "role": "crafter",
-                "stock": {"rope": 1, "stone": 4, "wood": 4, "hoe_wood": 1},
-                "trade_offer": "2 wood + 2 stone -> 1 rope / 3 wood + 2 fiber -> 1 hoe",
+                "stock": {"bread": 1, "wood": 4, "stone": 4, "fiber": 3, "hoe_wood": 1},
+                "trade_offer": "3 wheat -> 1 bread / 3 wood + 2 fiber -> 1 hoe",
             },
             "police": {
                 "color": (60, 105, 170),
@@ -194,16 +206,50 @@ class Game:
 
     def _refresh_frame_caches(self):
         self._frame_cache_token += 1
-        self._cached_npcs = [entity for entity in self.world.with_component(AIController) if entity.alive]
-        self._cached_combatants = [entity for entity in self._cached_npcs if entity.alive]
+        all_entities = self.world.all()
+        self._cached_all_entities = all_entities
+        self._cached_npcs = []
+        self._cached_combatants = []
+        self._cached_combatants_by_tag = {}
+        structure_entities = []
+        openable_doors = []
+        drops = []
+        interactables = []
+
+        for entity in all_entities:
+            ai = entity.get(AIController)
+            if ai:
+                self._cached_npcs.append(entity)
+                self._cached_combatants.append(entity)
+                for tag in entity.tags:
+                    self._cached_combatants_by_tag.setdefault(tag, []).append(entity)
+            structure = entity.get(StructureComponent)
+            if structure:
+                structure_entities.append(entity)
+                if structure.openable:
+                    openable_doors.append(entity)
+            if entity.get(DroppedItem):
+                drops.append(entity)
+            if entity.get(Interactable):
+                interactables.append(entity)
+
         if self.player.alive:
             self._cached_combatants.append(self.player)
-        self._rebuild_structure_collision_cache()
+            for tag in self.player.tags:
+                self._cached_combatants_by_tag.setdefault(tag, []).append(self.player)
+        if len(structure_entities) != len(self._cached_structure_entities):
+            self._structure_cache_dirty = True
+        self._cached_structure_entities = structure_entities
+        self._cached_openable_doors = openable_doors
+        self._cached_drops = drops
+        self._cached_interactables = interactables
+        if self._structure_cache_dirty:
+            self._rebuild_structure_collision_cache()
 
     def _rebuild_structure_collision_cache(self):
         self._cached_solid_structure_colliders = []
         self._cached_solid_structure_rects = []
-        for entity in self.world.with_component(StructureComponent):
+        for entity in self._cached_structure_entities:
             if not entity.alive:
                 continue
             structure = entity.get(StructureComponent)
@@ -211,6 +257,7 @@ class Game:
             if structure and collider and structure.blocks_movement():
                 self._cached_solid_structure_colliders.append(collider)
                 self._cached_solid_structure_rects.append(collider.get_rect())
+        self._structure_cache_dirty = False
 
     def _current_npcs(self):
         return self._cached_npcs
@@ -358,35 +405,75 @@ class Game:
             if overlaps:
                 entity.destroy()
 
-    def _build_village_farmland(self, base_x, base_y):
+    def _choose_village_plot_plans(self, total_plots):
+        templates = {
+            "wheat": {"seed_item": "wheat_seed", "plant_type": "wheat_crop", "produce_item": "wheat", "name": "Wheat"},
+            "berry": {"seed_item": "berry_seed", "plant_type": "berry_bush", "produce_item": "berry", "name": "Berries"},
+        }
+        wheat_count = random.randint(max(4, total_plots // 3), max(5, (total_plots * 2) // 3))
+        berry_count = max(0, total_plots - wheat_count)
+        plans = [dict(templates["wheat"]) for _ in range(wheat_count)]
+        plans.extend(dict(templates["berry"]) for _ in range(berry_count))
+        random.shuffle(plans)
+        return plans
+
+    def _build_village_farmland(self, base_x, base_y, plot_plans):
         farm_plots = []
-        for offset_x, offset_y in [(0, 5), (1, 5), (0, 6), (1, 6), (10, 5), (11, 5), (10, 6), (11, 6)]:
+        plot_offsets = []
+        for start_x, start_y, width, height in ((0, 5, 4, 4), (12, 5, 4, 4)):
+            for row in range(height):
+                for col in range(width):
+                    plot_offsets.append((start_x + col, start_y + row))
+        for index, (offset_x, offset_y) in enumerate(plot_offsets):
             plot_x = base_x + offset_x * TILE_SIZE
             plot_y = base_y + offset_y * TILE_SIZE
+            plot_plan = dict(plot_plans[index % len(plot_plans)])
             soil = self._create_structure("farmland", plot_x, plot_y)
             self.world.add(soil)
-            crop = self._create_resource_node("berry_bush", plot_x, plot_y)
+            crop = self._create_resource_node(plot_plan["plant_type"], plot_x, plot_y)
             crop_plant = crop.get(PlantComponent)
-            crop_plant.growth_stage = random.randint(GROWTH_SPROUT, GROWTH_MATURE)
+            crop_plant.growth_stage = random.randint(GROWTH_SEED, GROWTH_MATURE)
             self.world.add(crop)
             farm_plots.append({
                 "soil": soil,
                 "crop": crop,
                 "plot_pos": pygame.Vector2(plot_x, plot_y),
                 "work_pos": pygame.Vector2(plot_x, plot_y + 10),
+                "seed_item": plot_plan["seed_item"],
+                "plant_type": plot_plan["plant_type"],
+                "produce_item": plot_plan["produce_item"],
+                "crop_name": plot_plan["name"],
             })
         return farm_plots
 
     def _build_village_storage(self, base_x, base_y):
-        chest_x = base_x + TILE_SIZE * 5
-        chest_y = base_y + TILE_SIZE * 5
+        chest_x = base_x + TILE_SIZE * 7
+        chest_y = base_y + TILE_SIZE * 6
         chest = self._create_structure("chest_wood", chest_x, chest_y)
         self.world.add(chest)
         return chest
 
+    def _prime_village_storage(self, village):
+        chest = village.get("storage_chest")
+        if not chest or not chest.alive:
+            return
+        container = chest.get(Container)
+        if not container:
+            return
+        wheat_plots = sum(1 for plot in village["farm_plots"] if plot["seed_item"] == "wheat_seed")
+        berry_plots = sum(1 for plot in village["farm_plots"] if plot["seed_item"] == "berry_seed")
+        for item_id, qty in (
+            ("wheat_seed", max(4, wheat_plots + 2)),
+            ("berry_seed", max(3, berry_plots + 1)),
+            ("wheat", 4),
+            ("berry", 4),
+            ("bread", 2),
+        ):
+            self._add_to_container(container, item_id, qty)
+
     def _spawn_villages(self):
-        village_width = 12
-        village_height = 12
+        village_width = 16
+        village_height = 15
         village_id = 0
         attempts = 0
         while village_id < 2 and attempts < 1000:
@@ -398,44 +485,50 @@ class Game:
             self._clear_area_for_village(tile_x, tile_y, village_width, village_height)
             center_x = tile_x * TILE_SIZE
             center_y = tile_y * TILE_SIZE
+            total_plots = 32
+            plot_plans = self._choose_village_plot_plans(total_plots)
+            village_bounds = pygame.Rect(center_x, center_y, village_width * TILE_SIZE, village_height * TILE_SIZE)
             village = {
                 "id": village_id,
-                "center": pygame.Vector2(center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 6),
-                "radius": TILE_SIZE * 8,
+                "center": pygame.Vector2(center_x + TILE_SIZE * 8, center_y + TILE_SIZE * 7),
+                "radius": TILE_SIZE * 10,
+                "bounds": village_bounds,
                 "bed_spots": [],
                 "home_slots": [],
-                "farm_plots": self._build_village_farmland(center_x, center_y),
+                "farm_plots": self._build_village_farmland(center_x, center_y, plot_plans),
+                "seed_types": sorted({plot["seed_item"] for plot in plot_plans}),
                 "craft_spots": [
-                    pygame.Vector2(center_x + TILE_SIZE * 4, center_y + TILE_SIZE * 4),
-                    pygame.Vector2(center_x + TILE_SIZE * 7, center_y + TILE_SIZE * 4),
-                    pygame.Vector2(center_x + TILE_SIZE * 7, center_y + TILE_SIZE * 7),
-                    pygame.Vector2(center_x + TILE_SIZE * 4, center_y + TILE_SIZE * 7),
+                    pygame.Vector2(center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 5),
+                    pygame.Vector2(center_x + TILE_SIZE * 9, center_y + TILE_SIZE * 5),
+                    pygame.Vector2(center_x + TILE_SIZE * 9, center_y + TILE_SIZE * 8),
+                    pygame.Vector2(center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 8),
                 ],
                 "patrol_points": [
-                    pygame.Vector2(center_x + TILE_SIZE * 2, center_y + TILE_SIZE * 6),
-                    pygame.Vector2(center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 2),
-                    pygame.Vector2(center_x + TILE_SIZE * 9, center_y + TILE_SIZE * 6),
-                    pygame.Vector2(center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 9),
+                    pygame.Vector2(center_x + TILE_SIZE * 2, center_y + TILE_SIZE * 7),
+                    pygame.Vector2(center_x + TILE_SIZE * 8, center_y + TILE_SIZE * 2),
+                    pygame.Vector2(center_x + TILE_SIZE * 13, center_y + TILE_SIZE * 7),
+                    pygame.Vector2(center_x + TILE_SIZE * 8, center_y + TILE_SIZE * 12),
                 ],
             }
             self.villages.append(village)
             village["storage_chest"] = self._build_village_storage(center_x, center_y)
+            self._prime_village_storage(village)
 
             for house_origin in [
                 (center_x + TILE_SIZE, center_y),
-                (center_x + TILE_SIZE * 7, center_y),
-                (center_x + TILE_SIZE * 4, center_y + TILE_SIZE * 8),
+                (center_x + TILE_SIZE * 11, center_y),
+                (center_x + TILE_SIZE * 6, center_y + TILE_SIZE * 11),
             ]:
                 for home_slot in self._build_house(*house_origin):
                     village["bed_spots"].append(home_slot["bed"])
                     village["home_slots"].append(home_slot)
 
             spawn_plan = [
-                ("villager_farmer", (TILE_SIZE * 5, TILE_SIZE * 4)),
                 ("villager_farmer", (TILE_SIZE * 6, TILE_SIZE * 4)),
-                ("villager_crafter", (TILE_SIZE * 4, TILE_SIZE * 6)),
-                ("villager_crafter", (TILE_SIZE * 7, TILE_SIZE * 6)),
-                ("police", (TILE_SIZE * 6, TILE_SIZE * 7)),
+                ("villager_farmer", (TILE_SIZE * 9, TILE_SIZE * 4)),
+                ("villager_crafter", (TILE_SIZE * 6, TILE_SIZE * 7)),
+                ("villager_crafter", (TILE_SIZE * 9, TILE_SIZE * 7)),
+                ("police", (TILE_SIZE * 8, TILE_SIZE * 9)),
             ]
             farmer_slot = 0
             crafter_slot = 0
@@ -443,14 +536,26 @@ class Game:
                 home_slot = village["home_slots"][idx % len(village["home_slots"])] if village["home_slots"] else None
                 work_points = None
                 farm_plots = None
+                idle_route = []
+                work_pause_range = (0.2, 0.45)
                 if ai_type == "villager_farmer":
                     farm_plots = [plot for plot_index, plot in enumerate(village["farm_plots"]) if plot_index % 2 == farmer_slot]
+                    idle_route = [
+                        pygame.Vector2(center_x + TILE_SIZE * 5, center_y + TILE_SIZE * 6),
+                        pygame.Vector2(center_x + TILE_SIZE * 7, center_y + TILE_SIZE * 6),
+                        pygame.Vector2(center_x + TILE_SIZE * 9, center_y + TILE_SIZE * 6),
+                    ]
+                    work_pause_range = (0.1, 0.3)
                     farmer_slot += 1
                 elif ai_type == "villager_crafter":
                     work_points = [point for point_index, point in enumerate(village["craft_spots"]) if point_index % 2 == crafter_slot]
+                    idle_route = list(village["craft_spots"])
+                    work_pause_range = (0.12, 0.28)
                     crafter_slot += 1
                 elif ai_type == "police":
                     work_points = list(village["patrol_points"])
+                    idle_route = list(village["patrol_points"])
+                    work_pause_range = (0.08, 0.2)
                 npc = self._create_npc(
                     ai_type,
                     center_x + offset[0],
@@ -461,6 +566,10 @@ class Game:
                     farm_plots=farm_plots,
                     work_points=work_points,
                     storage_chest=village["storage_chest"],
+                    village_bounds=village_bounds,
+                    idle_route=idle_route,
+                    work_pause_range=work_pause_range,
+                    home_bounds=home_slot["house_rect"] if home_slot else None,
                 )
                 self.world.add(npc)
             village_id += 1
@@ -469,6 +578,7 @@ class Game:
         width = 4
         height = 4
         bed_slots = []
+        house_rect = pygame.Rect(base_x, base_y, width * TILE_SIZE, height * TILE_SIZE)
         door_col = width // 2 - 1
         door_x = base_x + door_col * TILE_SIZE
         doorway_outside = pygame.Vector2(door_x, base_y + (height - 1) * TILE_SIZE + 6)
@@ -483,12 +593,13 @@ class Game:
                     self.world.add(self._create_structure("wall_wood", wx, wy))
         for col in (1, 2):
             bed_x = base_x + col * TILE_SIZE
-            bed_y = base_y + TILE_SIZE * 2
+            bed_y = base_y + TILE_SIZE
             self.world.add(self._create_structure("bed", bed_x, bed_y))
             bed_point = pygame.Vector2(bed_x, bed_y + 6)
             bed_slots.append({
                 "bed": bed_point,
                 "path": [doorway_outside, doorway_inside, bed_point],
+                "house_rect": house_rect.copy(),
             })
         return bed_slots
 
@@ -559,6 +670,11 @@ class Game:
             entity.add(SpriteRenderer((120, 120, 125), 54, 50, "diamond", LAYER_PLANTS, sprite_path))
             plant = PlantComponent("iron_vein", GROWTH_FULL, [TILE_STONE])
             interact = Interactable("Mine iron", 1.25)
+        elif node_type == "wheat_crop":
+            entity.add(Collider(24, 24, 18, 36))
+            entity.add(SpriteRenderer(COL_WHEAT, 30, 46, "rect", LAYER_PLANTS, sprite_path))
+            plant = PlantComponent("wheat_crop", GROWTH_FULL, [TILE_GRASS, TILE_DIRT])
+            interact = Interactable("Harvest wheat", 0.45)
         elif node_type == "reed_patch":
             entity.add(Collider(28, 28, 4, 6))
             entity.add(SpriteRenderer(COL_REED, 24, 36, "rect", LAYER_PLANTS, sprite_path))
@@ -584,7 +700,8 @@ class Game:
         entity.add(interact)
         return entity
 
-    def _create_npc(self, ai_type, x, y, village_id=None, home_pos=None, sleep_path=None, farm_plots=None, work_points=None, storage_chest=None):
+    def _create_npc(self, ai_type, x, y, village_id=None, home_pos=None, sleep_path=None, farm_plots=None, work_points=None,
+                    storage_chest=None, village_bounds=None, idle_route=None, work_pause_range=None, home_bounds=None):
         profile = self.npc_profiles[ai_type]
         entity = Entity(profile["label"])
         entity.tags.update({"npc", ai_type, "combatant"})
@@ -612,6 +729,7 @@ class Game:
             attack_range=profile["attack_range"],
         )
         ai.home_pos = pygame.Vector2(home_pos) if home_pos else pygame.Vector2(x, y)
+        ai.home_bounds = home_bounds.copy() if home_bounds else None
         ai.state_timer = random.uniform(0.2, 1.5)
         ai.wander_dir = pygame.Vector2(random.uniform(-1, 1), random.uniform(-1, 1))
         ai.role = profile.get("role", ai_type)
@@ -624,10 +742,20 @@ class Game:
         ai.home_radius = TILE_SIZE * 5 if village_id is not None else TILE_SIZE * 8
         ai.sleep_path = [pygame.Vector2(point) for point in (sleep_path or [])]
         ai.sleep_path_index = 0
+        ai.sleeping = False
         ai.farm_plots = list(farm_plots or [])
         ai.work_points = [pygame.Vector2(point) for point in (work_points or [])]
         ai.work_index = 0
         ai.storage_chest = storage_chest
+        ai.village_bounds = village_bounds.copy() if village_bounds else None
+        ai.idle_route = [pygame.Vector2(point) for point in (idle_route or ai.work_points)]
+        ai.last_pos = pygame.Vector2(x, y)
+        if work_pause_range:
+            ai.work_pause_range = work_pause_range
+        if ai_type in {"villager_farmer", "villager_crafter", "police"}:
+            ai.max_hunger = VILLAGER_MAX_HUNGER
+            ai.hunger = random.uniform(VILLAGER_MAX_HUNGER * 0.55, VILLAGER_MAX_HUNGER)
+            ai.hunger_drain = VILLAGER_HUNGER_DRAIN_RATE
         entity.add(ai)
         return entity
 
@@ -648,7 +776,8 @@ class Game:
             entity.add(SpriteRenderer(item["color"], TILE_SIZE - 4, TILE_SIZE - 12, "rect", LAYER_PLANTS,
                                       sprite_path=self._sprite_path("entities", "chest_wood.png")))
             entity.add(StructureComponent("chest_wood", solid=True))
-            entity.add(Container(max_slots=16))
+            entity.add(Container(max_slots=24))
+            entity.add(Interactable("Open chest", 0.0))
         elif structure_type == "farmland":
             entity.add(SpriteRenderer(COL_FARMLAND, TILE_SIZE - 2, TILE_SIZE - 6, "rect", LAYER_DETAIL,
                                       sprite_path=self._sprite_path("entities", "farmland.png")))
@@ -692,16 +821,27 @@ class Game:
             if event.type == pygame.QUIT:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
+                if self.show_inventory and self.craft_search_active and event.key == pygame.K_BACKSPACE:
+                    self.craft_search_text = self.craft_search_text[:-1]
+                    self._clamp_recipe_selection()
+                    continue
+                if self.show_inventory and self.craft_search_active and event.unicode and event.unicode.isprintable() and not event.unicode.isspace():
+                    self.craft_search_text += event.unicode.lower()
+                    self._clamp_recipe_selection()
+                    continue
                 if event.key == pygame.K_ESCAPE:
                     if self.show_inventory:
-                        self.show_inventory = False
-                        self.craft_search_active = False
+                        self._close_inventory_views()
                     else:
                         self.running = False
                 elif event.key == pygame.K_i:
                     self.show_inventory = not self.show_inventory
                     self.show_crafting = self.show_inventory
                     self.craft_search_active = self.show_inventory
+                    if not self.show_inventory:
+                        self._close_inventory_views()
+                    else:
+                        self.open_container_entity = None
                 elif pygame.K_1 <= event.key <= pygame.K_9:
                     self.player.get(Inventory).selected_hotbar = event.key - pygame.K_1
                     self._show_selected_item_name(self.player.get(Inventory).get_selected())
@@ -711,23 +851,18 @@ class Game:
                     self._drop_selected_item()
                 elif event.key == pygame.K_SPACE:
                     self.pending_attack = True
-                elif self.show_inventory and self.craft_search_active and event.key == pygame.K_BACKSPACE:
-                    self.craft_search_text = self.craft_search_text[:-1]
-                    self._clamp_recipe_selection()
                 elif event.key == pygame.K_RETURN:
                     crafted = self._craft_selected_recipe()
                     self._set_message(f"Crafted {crafted}" if crafted else "That recipe is not craftable yet")
                 elif event.key == pygame.K_UP:
                     self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
+                    self._clamp_recipe_selection()
                 elif event.key == pygame.K_DOWN:
                     self.selected_recipe_index += 1
                     self._clamp_recipe_selection()
                 elif event.key == pygame.K_r:
                     self.last_seed = random.randint(1000, 999999)
                     self._set_message(f"Current generated map seed: {self.last_seed}")
-                elif self.show_inventory and self.craft_search_active and event.unicode and event.unicode.isprintable() and not event.unicode.isspace():
-                    self.craft_search_text += event.unicode.lower()
-                    self._clamp_recipe_selection()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     self._handle_left_click(event.pos)
@@ -735,15 +870,20 @@ class Game:
                     self._place_selected_structure()
                 elif event.button == 4:
                     self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
+                    self._clamp_recipe_selection()
                 elif event.button == 5:
-                    self.selected_recipe_index = min(len(self.recipe_order) - 1, self.selected_recipe_index + 1)
+                    self.selected_recipe_index += 1
+                    self._clamp_recipe_selection()
 
     def _update(self, dt):
         self.message_timer = max(0.0, self.message_timer - dt)
         self.attack_cooldown = max(0.0, self.attack_cooldown - dt)
         self.selected_item_label_timer = max(0.0, self.selected_item_label_timer - dt)
+        self.instant_interact_cooldown = max(0.0, self.instant_interact_cooldown - dt)
         self.trade_interact_cooldown = max(0.0, self.trade_interact_cooldown - dt)
         self.harvest_hint = ""
+        self._update_trade_popups(dt)
+        self._sync_open_container()
         self._refresh_frame_caches()
         self._update_world_simulation(dt)
         self._update_player(dt)
@@ -888,26 +1028,21 @@ class Game:
                 continue
             ai.activity_timer -= dt
             ai.trade_timer -= dt
+            if ai.trade_task:
+                partner = ai.trade_task.get("partner")
+                if not partner or not partner.alive:
+                    self._clear_trade_task(ai)
+
+            if ai.ai_type in {"villager_farmer", "villager_crafter", "police"} and ai.hunger <= VILLAGER_EAT_THRESHOLD:
+                self._villager_eat(ai)
 
             if ai.ai_type == "villager_farmer" and ai.activity_timer <= 0:
-                ai.stock["fiber"] = ai.stock.get("fiber", 0) + random.randint(0, 2)
-                ai.stock["berry_seed"] = ai.stock.get("berry_seed", 0) + random.randint(0, 1)
-                ai.activity_timer = random.uniform(4.0, 7.0)
+                ai.stock["fiber"] = ai.stock.get("fiber", 0) + random.randint(0, 1)
+                ai.activity_timer = random.uniform(4.0, 6.5)
 
             if ai.ai_type == "villager_crafter" and ai.activity_timer <= 0:
-                if ai.stock.get("wood", 0) >= 3 and ai.stock.get("fiber", 0) >= 2 and ai.stock.get("hoe_wood", 0) < 2:
-                    ai.stock["wood"] -= 3
-                    ai.stock["fiber"] -= 2
-                    ai.stock["hoe_wood"] = ai.stock.get("hoe_wood", 0) + 1
-                elif ai.stock.get("wood", 0) >= 2 and ai.stock.get("fiber", 0) >= 2:
-                    ai.stock["wood"] -= 2
-                    ai.stock["fiber"] -= 2
-                    ai.stock["rope"] = ai.stock.get("rope", 0) + 1
-                elif ai.stock.get("wood", 0) >= 2 and ai.stock.get("stone", 0) >= 2:
-                    ai.stock["wood"] -= 2
-                    ai.stock["stone"] -= 2
-                    ai.stock["sword_wood"] = ai.stock.get("sword_wood", 0) + 1
-                ai.activity_timer = random.uniform(5.0, 8.0)
+                self._run_crafter_activity(ai)
+                ai.activity_timer = random.uniform(4.5, 7.5)
 
         for village in self.villages:
             farmers = []
@@ -920,29 +1055,190 @@ class Game:
                 if getattr(ai, "village_id", None) != village["id"]:
                     continue
                 if ai.ai_type == "villager_farmer":
-                    farmers.append(ai)
+                    farmers.append(entity)
                 elif ai.ai_type == "villager_crafter":
-                    crafters.append(ai)
+                    crafters.append(entity)
                 elif ai.ai_type == "police":
-                    guards.append(ai)
+                    guards.append(entity)
+            self._schedule_village_trades(farmers, crafters, guards)
 
-            for farmer in farmers:
-                if crafters and farmer.trade_timer <= 0 and (farmer.stock.get("berry", 0) >= 2 or farmer.stock.get("fiber", 0) >= 1):
-                    crafter = random.choice(crafters)
-                    transfer_berry = min(2, farmer.stock.get("berry", 0))
-                    transfer_fiber = min(1, farmer.stock.get("fiber", 0))
-                    farmer.stock["berry"] = farmer.stock.get("berry", 0) - transfer_berry
-                    farmer.stock["fiber"] = farmer.stock.get("fiber", 0) - transfer_fiber
-                    crafter.stock["berry"] = crafter.stock.get("berry", 0) + transfer_berry
-                    crafter.stock["fiber"] = crafter.stock.get("fiber", 0) + transfer_fiber
-                    farmer.trade_timer = random.uniform(5.0, 8.0)
+    def _run_crafter_activity(self, ai):
+        if ai.stock.get("wheat", 0) >= 3 and ai.stock.get("bread", 0) < 3:
+            ai.stock["wheat"] -= 3
+            ai.stock["bread"] = ai.stock.get("bread", 0) + 1
+        elif ai.stock.get("wood", 0) >= 3 and ai.stock.get("fiber", 0) >= 2 and ai.stock.get("hoe_wood", 0) < 2:
+            ai.stock["wood"] -= 3
+            ai.stock["fiber"] -= 2
+            ai.stock["hoe_wood"] = ai.stock.get("hoe_wood", 0) + 1
+        elif ai.stock.get("wood", 0) >= 2 and ai.stock.get("stone", 0) >= 2 and ai.stock.get("sword_wood", 0) < 2:
+            ai.stock["wood"] -= 2
+            ai.stock["stone"] -= 2
+            ai.stock["sword_wood"] = ai.stock.get("sword_wood", 0) + 1
+        elif ai.stock.get("wood", 0) >= 2 and ai.stock.get("fiber", 0) >= 2 and ai.stock.get("rope", 0) < 3:
+            ai.stock["wood"] -= 2
+            ai.stock["fiber"] -= 2
+            ai.stock["rope"] = ai.stock.get("rope", 0) + 1
 
-            for crafter in crafters:
-                if guards and crafter.trade_timer <= 0 and crafter.stock.get("sword_wood", 0) >= 1:
-                    guard = random.choice(guards)
-                    crafter.stock["sword_wood"] -= 1
-                    guard.stock["sword_wood"] = guard.stock.get("sword_wood", 0) + 1
-                    crafter.trade_timer = random.uniform(6.0, 10.0)
+    def _schedule_village_trades(self, farmers, crafters, guards):
+        for farmer in farmers:
+            farmer_ai = farmer.get(AIController)
+            if not self._ai_ready_for_trade(farmer_ai):
+                continue
+            crafter = self._nearest_trade_candidate(farmer, crafters)
+            if not crafter:
+                continue
+            give_items, receive_items = self._build_farmer_trade(farmer_ai, crafter.get(AIController))
+            if give_items:
+                self._assign_villager_trade(farmer, crafter, give_items, receive_items)
+
+        for crafter in crafters:
+            crafter_ai = crafter.get(AIController)
+            if not self._ai_ready_for_trade(crafter_ai):
+                continue
+            guard = self._nearest_trade_candidate(crafter, guards)
+            if not guard:
+                continue
+            give_items = self._build_guard_trade(crafter_ai, guard.get(AIController))
+            if give_items:
+                self._assign_villager_trade(crafter, guard, give_items, [])
+
+    def _ai_ready_for_trade(self, ai):
+        return ai and ai.trade_timer <= 0 and not ai.trade_task
+
+    def _nearest_trade_candidate(self, source_entity, candidates):
+        valid = []
+        source_transform = source_entity.get(Transform)
+        if not source_transform:
+            return None
+        source_pos = pygame.Vector2(source_transform.x, source_transform.y)
+        for candidate in candidates:
+            if not candidate.alive or candidate is source_entity:
+                continue
+            ai = candidate.get(AIController)
+            transform = candidate.get(Transform)
+            if not ai or not transform or not self._ai_ready_for_trade(ai):
+                continue
+            valid.append((source_pos.distance_to(pygame.Vector2(transform.x, transform.y)), candidate))
+        if not valid:
+            return None
+        valid.sort(key=lambda entry: entry[0])
+        return valid[0][1]
+
+    def _build_farmer_trade(self, farmer_ai, crafter_ai):
+        give_items = []
+        receive_items = []
+        if farmer_ai.stock.get("wheat", 0) >= 3 and crafter_ai.stock.get("wheat", 0) < 6:
+            give_items.append(("wheat", 3))
+        elif farmer_ai.stock.get("berry", 0) >= 2 and crafter_ai.stock.get("berry", 0) < 5:
+            give_items.append(("berry", 2))
+        elif farmer_ai.stock.get("fiber", 0) >= 2 and crafter_ai.stock.get("fiber", 0) < 6:
+            give_items.append(("fiber", 2))
+
+        if not give_items:
+            return [], []
+
+        if crafter_ai.stock.get("bread", 0) >= 1 and farmer_ai.hunger < VILLAGER_EAT_THRESHOLD:
+            receive_items.append(("bread", 1))
+        elif crafter_ai.stock.get("hoe_wood", 0) >= 1 and farmer_ai.stock.get("hoe_wood", 0) < 1:
+            receive_items.append(("hoe_wood", 1))
+        return give_items, receive_items
+
+    def _build_guard_trade(self, crafter_ai, guard_ai):
+        if crafter_ai.stock.get("sword_wood", 0) >= 1 and guard_ai.stock.get("sword_wood", 0) < 1:
+            return [("sword_wood", 1)]
+        if crafter_ai.stock.get("bread", 0) >= 1 and guard_ai.hunger < VILLAGER_EAT_THRESHOLD:
+            return [("bread", 1)]
+        return []
+
+    def _assign_villager_trade(self, giver_entity, receiver_entity, give_items, receive_items):
+        giver_ai = giver_entity.get(AIController)
+        receiver_ai = receiver_entity.get(AIController)
+        giver_transform = giver_entity.get(Transform)
+        receiver_transform = receiver_entity.get(Transform)
+        meeting_point = pygame.Vector2(
+            (giver_transform.x + receiver_transform.x) * 0.5,
+            (giver_transform.y + receiver_transform.y) * 0.5,
+        )
+        giver_ai.trade_partner = receiver_entity
+        receiver_ai.trade_partner = giver_entity
+        giver_ai.trade_task = {
+            "partner": receiver_entity,
+            "meeting_point": meeting_point,
+            "give": list(give_items),
+            "receive": list(receive_items),
+            "initiator": True,
+        }
+        receiver_ai.trade_task = {
+            "partner": giver_entity,
+            "meeting_point": meeting_point,
+            "give": list(receive_items),
+            "receive": list(give_items),
+            "initiator": False,
+        }
+
+    def _clear_trade_task(self, ai, clear_partner=True):
+        partner = ai.trade_partner if clear_partner else None
+        ai.trade_partner = None
+        ai.trade_task = None
+        if clear_partner and partner and partner.alive:
+            partner_ai = partner.get(AIController)
+            if partner_ai and partner_ai.trade_partner is ai.entity:
+                self._clear_trade_task(partner_ai, clear_partner=False)
+
+    def _villager_eat(self, ai):
+        for item_id in ("bread", "berry", "mushroom"):
+            if ai.stock.get(item_id, 0) > 0:
+                ai.stock[item_id] -= 1
+                ai.eat(ITEMS.get(item_id, {}).get("food_restore", 10))
+                return True
+        chest = getattr(ai, "storage_chest", None)
+        if not chest or not chest.alive:
+            return False
+        container = chest.get(Container)
+        if not container:
+            return False
+        for item_id in ("bread", "berry"):
+            if self._take_from_container(container, item_id, 1):
+                ai.eat(ITEMS.get(item_id, {}).get("food_restore", 10))
+                return True
+        return False
+
+    def _complete_villager_trade(self, initiator_ai):
+        task = initiator_ai.trade_task
+        if not task:
+            return
+        partner = task.get("partner")
+        if not partner or not partner.alive:
+            self._clear_trade_task(initiator_ai)
+            return
+        partner_ai = partner.get(AIController)
+        any_transfer = False
+
+        for item_id, qty in task.get("give", []):
+            moved = self._transfer_stock(initiator_ai, partner_ai, item_id, qty)
+            any_transfer = any_transfer or moved > 0
+        for item_id, qty in task.get("receive", []):
+            moved = self._transfer_stock(partner_ai, initiator_ai, item_id, qty)
+            any_transfer = any_transfer or moved > 0
+
+        initiator_ai.trade_timer = random.uniform(5.0, 8.0)
+        partner_ai.trade_timer = random.uniform(5.0, 8.0)
+        initiator_ai.state_timer = random.uniform(0.2, 0.45)
+        partner_ai.state_timer = random.uniform(0.2, 0.45)
+        self._clear_trade_task(initiator_ai)
+        if any_transfer:
+            initiator_ai.activity_timer = max(initiator_ai.activity_timer, 0.8)
+            partner_ai.activity_timer = max(partner_ai.activity_timer, 0.8)
+
+    def _transfer_stock(self, giver_ai, receiver_ai, item_id, requested_qty):
+        moved = min(requested_qty, giver_ai.stock.get(item_id, 0))
+        if moved <= 0:
+            return 0
+        giver_ai.stock[item_id] -= moved
+        receiver_ai.stock[item_id] = receiver_ai.stock.get(item_id, 0) + moved
+        self._spawn_trade_popup(giver_ai.entity, item_id, moved, positive=False)
+        self._spawn_trade_popup(receiver_ai.entity, item_id, moved, positive=True)
+        return moved
 
     def _update_zombie_spawns(self, dt):
         if not self._is_night():
@@ -978,6 +1274,74 @@ class Game:
             self.world.add(self._create_npc("zombie", spawn_x, spawn_y))
             break
 
+    def _entity_center(self, entity):
+        transform = entity.get(Transform) if entity else None
+        if not transform:
+            return pygame.Vector2()
+        collider = entity.get(Collider)
+        if collider:
+            rect = collider.get_rect()
+            return pygame.Vector2(rect.centerx, rect.centery)
+        return pygame.Vector2(transform.x + TILE_SIZE / 2, transform.y + TILE_SIZE / 2)
+
+    def _villager_safe_inside_home(self, ai, entity, threat):
+        if not threat or ai.ai_type not in {"villager_farmer", "villager_crafter"}:
+            return False
+        home_bounds = getattr(ai, "home_bounds", None)
+        if not home_bounds:
+            return False
+        villager_center = self._entity_center(entity)
+        if not home_bounds.inflate(-10, -10).collidepoint(villager_center):
+            return False
+        threat_center = self._entity_center(threat)
+        return not home_bounds.inflate(12, 12).collidepoint(threat_center)
+
+    def _npc_separation_vector(self, source_entity, neighbors, radius=34):
+        source_center = self._entity_center(source_entity)
+        push = pygame.Vector2()
+        weight = 0.0
+        source_ai = source_entity.get(AIController)
+        source_partner = getattr(source_ai, "trade_partner", None) if source_ai else None
+
+        for other in neighbors:
+            if other is source_entity or not other.alive:
+                continue
+            other_ai = other.get(AIController)
+            if not other_ai:
+                continue
+            if source_partner is other or getattr(other_ai, "trade_partner", None) is source_entity:
+                continue
+            delta = source_center - self._entity_center(other)
+            dist_sq = delta.length_squared()
+            if dist_sq >= radius * radius:
+                continue
+            if dist_sq <= 0.01:
+                delta = self._random_direction()
+                dist_sq = 1.0
+            dist = math.sqrt(dist_sq)
+            strength = (radius - dist) / radius
+            push += delta.normalize() * strength
+            weight += strength
+
+        if weight <= 0:
+            return pygame.Vector2()
+        return push / weight
+
+    def _recover_stuck_npc(self, ai):
+        ai.path = []
+        ai.path_index = 0
+        ai.path_recalc_timer = 0.0
+        ai.route_pause_timer = max(ai.route_pause_timer, 0.08)
+        ai.state_timer = max(ai.state_timer, 0.08)
+        if getattr(ai, "farm_plots", None):
+            ai.work_index = (ai.work_index + 1) % max(1, len(ai.farm_plots))
+        elif getattr(ai, "work_points", None):
+            ai.work_index = (ai.work_index + 1) % max(1, len(ai.work_points))
+        elif getattr(ai, "idle_route", None):
+            ai.work_index = (ai.work_index + 1) % max(1, len(ai.idle_route))
+        ai.wander_dir = self._random_direction()
+        ai.stuck_timer = 0.0
+
     def _update_npcs(self, dt):
         player_transform = self.player.get(Transform)
         player_health = self.player.get(Health)
@@ -999,9 +1363,15 @@ class Game:
             distance = to_player.length()
             move = pygame.Vector2()
             nearest_threat = self._nearest_npc(entity, {"hostile", "zombie"}, max_range=220)
+            if self._villager_safe_inside_home(ai, entity, nearest_threat):
+                nearest_threat = None
 
             if ai.ai_type == "villager_farmer":
-                if nearest_threat:
+                if self._is_night() and ai.sleeping:
+                    ai.state = AIController.STATE_IDLE
+                    move = pygame.Vector2()
+                elif nearest_threat:
+                    ai.sleeping = False
                     ai.state = AIController.STATE_FLEE
                     threat_pos = pygame.Vector2(nearest_threat.get(Transform).x, nearest_threat.get(Transform).y)
                     flee_vec = npc_center - threat_pos
@@ -1014,10 +1384,16 @@ class Game:
                     else:
                         ai.state = AIController.STATE_WANDER
                 else:
+                    ai.sleeping = False
                     ai.sleep_path_index = 0
-                    move = self._farmer_work_direction(ai, transform)
+                    trade_move = self._villager_trade_direction(ai, transform)
+                    move = trade_move if trade_move is not None else self._farmer_work_direction(ai, transform)
             elif ai.ai_type == "villager_crafter":
-                if nearest_threat:
+                if self._is_night() and ai.sleeping:
+                    ai.state = AIController.STATE_IDLE
+                    move = pygame.Vector2()
+                elif nearest_threat:
+                    ai.sleeping = False
                     ai.state = AIController.STATE_FLEE
                     threat_pos = pygame.Vector2(nearest_threat.get(Transform).x, nearest_threat.get(Transform).y)
                     flee_vec = npc_center - threat_pos
@@ -1026,11 +1402,16 @@ class Game:
                 elif self._is_night():
                     move = self._npc_follow_sleep_path(ai, transform)
                 else:
+                    ai.sleeping = False
                     ai.sleep_path_index = 0
-                    move = self._villager_route_direction(ai, transform, 0.15, 0.45)
+                    trade_move = self._villager_trade_direction(ai, transform)
+                    move = trade_move if trade_move is not None else self._crafter_work_direction(ai, transform)
             elif ai.ai_type == "police":
+                if not self._is_night():
+                    ai.sleeping = False
                 threat = self._nearest_npc(entity, {"hostile", "zombie"}, max_range=260)
                 if threat:
+                    ai.sleeping = False
                     ai.state = AIController.STATE_CHASE
                     threat_vec = pygame.Vector2(threat.get(Transform).x - transform.x, threat.get(Transform).y - transform.y)
                     if threat_vec.length() <= ai.attack_range + 10:
@@ -1050,7 +1431,8 @@ class Game:
                     move = self._npc_follow_sleep_path(ai, transform)
                 else:
                     ai.sleep_path_index = 0
-                    move = self._villager_route_direction(ai, transform, 0.1, 0.3)
+                    trade_move = self._villager_trade_direction(ai, transform)
+                    move = trade_move if trade_move is not None else self._villager_route_direction(ai, transform, 0.1, 0.3)
             elif ai.ai_type == "zombie":
                 target = self._nearest_npc(entity, {"villager", "police", "player"}, max_range=320)
                 if target is self.player or (target and "player" in target.tags):
@@ -1123,6 +1505,15 @@ class Game:
                 elif ai.state == AIController.STATE_WANDER:
                     move = ai.wander_dir
 
+            requested_move = pygame.Vector2(move)
+            if ai.ai_type in {"villager_farmer", "villager_crafter", "police"}:
+                separation = self._npc_separation_vector(entity, npc_entities, radius=32)
+                if separation.length_squared() > 0:
+                    if requested_move.length_squared() > 0:
+                        move = requested_move * 1.25 + separation * 1.1
+                    else:
+                        move = separation
+
             if move.length_squared() > 0:
                 move = move.normalize()
                 if ai.ai_type == "zombie":
@@ -1135,7 +1526,18 @@ class Game:
                     speed = NPC_SPEED * (1.15 if ai.ai_type == "hostile" else 0.9 if ai.ai_type == "passive" else 1.0)
                 if ai.ai_type.startswith("villager") or ai.ai_type == "police":
                     self._open_nearby_doors(transform)
+                before_pos = pygame.Vector2(transform.x, transform.y)
                 self._move_entity(transform, collider, move.x * speed * dt, move.y * speed * dt)
+                moved_dist = before_pos.distance_to(pygame.Vector2(transform.x, transform.y))
+                if requested_move.length_squared() > 0 and moved_dist < 0.45:
+                    ai.stuck_timer += dt
+                    if ai.stuck_timer >= 0.3:
+                        self._recover_stuck_npc(ai)
+                else:
+                    ai.stuck_timer = max(0.0, ai.stuck_timer - dt * 2.0)
+            else:
+                ai.stuck_timer = max(0.0, ai.stuck_timer - dt * 2.0)
+            ai.last_pos.update(transform.x, transform.y)
             if renderer and ai.state in (AIController.STATE_ATTACK, AIController.STATE_CHASE):
                 renderer.alpha = 255
 
@@ -1144,12 +1546,17 @@ class Game:
         source_pos = pygame.Vector2(source_transform.x, source_transform.y)
         best = None
         best_dist = max_range
-        for entity in self._current_combatants():
+        candidate_entities = []
+        seen = set()
+        for tag in target_tags:
+            for entity in self._cached_combatants_by_tag.get(tag, []):
+                if entity.id not in seen:
+                    seen.add(entity.id)
+                    candidate_entities.append(entity)
+        for entity in candidate_entities:
             if not entity.alive:
                 continue
             if entity is source_entity:
-                continue
-            if not (entity.tags & set(target_tags)):
                 continue
             transform = entity.get(Transform)
             if not transform:
@@ -1180,7 +1587,8 @@ class Game:
             ai.path_recalc_timer = 1.0 if ai.ai_type.startswith("villager") else 0.75 if ai.ai_type == "police" else 0.5
 
         if not ai.path:
-            return direct
+            ai.state_timer = max(ai.state_timer, 0.12)
+            return pygame.Vector2()
 
         if ai.path_index < len(ai.path):
             target_tile = ai.path[ai.path_index]
@@ -1202,7 +1610,7 @@ class Game:
                 vec = target_pos - npc_center
             if vec.length_squared() > 0:
                 return vec.normalize()
-        return direct
+        return pygame.Vector2()
 
     def _npc_move_toward_point(self, ai, transform, target_pos):
         target_transform = Transform(target_pos.x, target_pos.y)
@@ -1215,21 +1623,32 @@ class Game:
         sleep_path = getattr(ai, "sleep_path", None) or []
         if not sleep_path:
             to_home = pygame.Vector2(ai.home_pos.x - transform.x, ai.home_pos.y - transform.y)
-            return to_home.normalize() if to_home.length_squared() > 16 else pygame.Vector2()
+            if to_home.length_squared() <= 16:
+                ai.sleeping = True
+                transform.x = ai.home_pos.x
+                transform.y = ai.home_pos.y
+                return pygame.Vector2()
+            ai.sleeping = False
+            return self._npc_move_toward_point(ai, transform, ai.home_pos)
 
         while ai.sleep_path_index < len(sleep_path):
             target = sleep_path[ai.sleep_path_index]
             if pygame.Vector2(transform.x, transform.y).distance_to(target) <= 18:
+                if ai.sleep_path_index == len(sleep_path) - 1:
+                    ai.sleeping = True
+                    transform.x = target.x
+                    transform.y = target.y
                 ai.sleep_path_index += 1
                 continue
-            to_target = pygame.Vector2(target.x - transform.x, target.y - transform.y)
-            return to_target.normalize() if to_target.length_squared() > 0 else pygame.Vector2()
+            ai.sleeping = False
+            return self._npc_move_toward_point(ai, transform, target)
+        ai.sleeping = True
         return pygame.Vector2()
 
     def _open_nearby_doors(self, transform, radius=28):
         probe = pygame.Rect(int(transform.x) - radius, int(transform.y) - radius, radius * 2 + TILE_SIZE, radius * 2 + TILE_SIZE)
         changed = False
-        for entity in self.world.with_component(StructureComponent):
+        for entity in self._cached_openable_doors:
             structure = entity.get(StructureComponent)
             collider = entity.get(Collider)
             if not structure or not structure.openable or structure.is_open or not collider:
@@ -1238,10 +1657,10 @@ class Game:
                 structure.is_open = True
                 changed = True
         if changed:
-            self._rebuild_structure_collision_cache()
+            self._structure_cache_dirty = True
 
     def _villager_route_direction(self, ai, transform, pause_min, pause_max):
-        work_points = getattr(ai, "work_points", None) or []
+        work_points = getattr(ai, "work_points", None) or getattr(ai, "idle_route", None) or []
         if not work_points:
             if ai.state_timer <= 0:
                 ai.state = AIController.STATE_WANDER
@@ -1249,72 +1668,209 @@ class Game:
                 ai.wander_dir = self._random_direction()
             return ai.wander_dir if ai.state == AIController.STATE_WANDER else pygame.Vector2()
 
-        if ai.state_timer > 0:
+        if ai.state_timer > 0 or getattr(ai, "route_pause_timer", 0) > 0:
             return pygame.Vector2()
 
         target = work_points[ai.work_index % len(work_points)]
-        to_target = pygame.Vector2(target.x - transform.x, target.y - transform.y)
-        if to_target.length_squared() <= 20 ** 2:
+        if pygame.Vector2(transform.x, transform.y).distance_to(target) <= 20:
             ai.work_index = (ai.work_index + 1) % len(work_points)
-            ai.state_timer = random.uniform(pause_min, pause_max)
+            ai.route_pause_timer = random.uniform(pause_min, pause_max)
             return pygame.Vector2()
-        return to_target.normalize() if to_target.length_squared() > 0 else pygame.Vector2()
+        return self._npc_move_toward_point(ai, transform, target)
+
+    def _villager_trade_direction(self, ai, transform):
+        task = getattr(ai, "trade_task", None)
+        if not task:
+            return None
+        partner = task.get("partner")
+        if not partner or not partner.alive:
+            self._clear_trade_task(ai)
+            return None
+        partner_transform = partner.get(Transform)
+        if not partner_transform:
+            self._clear_trade_task(ai)
+            return None
+
+        partner_pos = pygame.Vector2(partner_transform.x, partner_transform.y)
+        own_pos = pygame.Vector2(transform.x, transform.y)
+        if own_pos.distance_to(partner_pos) <= 28:
+            if task.get("initiator"):
+                self._complete_villager_trade(ai)
+            return pygame.Vector2()
+
+        meeting_point = task.get("meeting_point") or (own_pos + partner_pos) * 0.5
+        target = meeting_point if own_pos.distance_to(meeting_point) > 16 else partner_pos
+        return self._npc_move_toward_point(ai, transform, target)
+
+    def _crafter_work_direction(self, ai, transform):
+        if self._crafter_should_store(ai):
+            chest = getattr(ai, "storage_chest", None)
+            if chest and chest.alive:
+                chest_transform = chest.get(Transform)
+                chest_pos = pygame.Vector2(chest_transform.x, chest_transform.y)
+                if pygame.Vector2(transform.x, transform.y).distance_to(chest_pos) <= 24:
+                    self._deposit_crafter_stock(ai)
+                    ai.state_timer = random.uniform(0.12, 0.25)
+                    return pygame.Vector2()
+                return self._npc_move_toward_point(ai, transform, chest_pos)
+        if self._crafter_needs_supplies(ai):
+            chest = getattr(ai, "storage_chest", None)
+            if chest and chest.alive:
+                chest_transform = chest.get(Transform)
+                chest_pos = pygame.Vector2(chest_transform.x, chest_transform.y)
+                if pygame.Vector2(transform.x, transform.y).distance_to(chest_pos) <= 24:
+                    self._withdraw_crafter_supplies(ai)
+                    ai.state_timer = random.uniform(0.12, 0.25)
+                    return pygame.Vector2()
+                return self._npc_move_toward_point(ai, transform, chest_pos)
+        return self._villager_route_direction(ai, transform, 0.15, 0.45)
 
     def _farmer_work_direction(self, ai, transform):
         farm_plots = [plot for plot in getattr(ai, "farm_plots", []) if plot.get("soil") and plot["soil"].alive]
         if not farm_plots:
             return self._villager_route_direction(ai, transform, 0.5, 1.1)
 
+        if self._farmer_needs_seed_refill(ai):
+            chest = getattr(ai, "storage_chest", None)
+            if chest and chest.alive:
+                chest_transform = chest.get(Transform)
+                chest_pos = pygame.Vector2(chest_transform.x, chest_transform.y)
+                if pygame.Vector2(transform.x, transform.y).distance_to(chest_pos) <= 24:
+                    self._withdraw_farmer_supplies(ai)
+                    ai.state_timer = random.uniform(0.15, 0.3)
+                    return pygame.Vector2()
+                return self._npc_move_toward_point(ai, transform, chest_pos)
+
         if self._farmer_should_store(ai):
             chest = getattr(ai, "storage_chest", None)
             if chest and chest.alive:
                 chest_transform = chest.get(Transform)
-                to_chest = pygame.Vector2(chest_transform.x - transform.x, chest_transform.y - transform.y)
-                if to_chest.length_squared() <= 24 ** 2:
+                chest_pos = pygame.Vector2(chest_transform.x, chest_transform.y)
+                if pygame.Vector2(transform.x, transform.y).distance_to(chest_pos) <= 24:
                     self._deposit_farmer_stock(ai)
                     ai.state_timer = random.uniform(0.15, 0.35)
                     return pygame.Vector2()
-                return to_chest.normalize() if to_chest.length_squared() > 0 else pygame.Vector2()
+                return self._npc_move_toward_point(ai, transform, chest_pos)
 
         if ai.state_timer > 0:
             return pygame.Vector2()
 
         plot = farm_plots[ai.work_index % len(farm_plots)]
         target = plot["work_pos"]
-        to_target = pygame.Vector2(target.x - transform.x, target.y - transform.y)
-        if to_target.length_squared() <= 22 ** 2:
+        if pygame.Vector2(transform.x, transform.y).distance_to(target) <= 22:
             self._tend_farm_plot(ai, plot)
             ai.work_index = (ai.work_index + 1) % len(farm_plots)
             ai.state_timer = random.uniform(0.15, 0.35)
             return pygame.Vector2()
-        return to_target.normalize() if to_target.length_squared() > 0 else pygame.Vector2()
+        return self._npc_move_toward_point(ai, transform, target)
 
     def _tend_farm_plot(self, ai, plot):
         crop = plot.get("crop")
         if crop is None or not crop.alive:
-            crop = self._create_resource_node("berry_bush", int(plot["plot_pos"].x), int(plot["plot_pos"].y))
+            seed_item = plot["seed_item"]
+            if ai.stock.get(seed_item, 0) <= 0:
+                return
+            crop = self._create_resource_node(plot["plant_type"], int(plot["plot_pos"].x), int(plot["plot_pos"].y))
             crop_plant = crop.get(PlantComponent)
-            crop_plant.growth_stage = GROWTH_SPROUT
+            crop_plant.growth_stage = GROWTH_SEED
             self.world.add(crop)
             plot["crop"] = crop
-            ai.stock["berry_seed"] = max(0, ai.stock.get("berry_seed", 1) - 1)
+            ai.stock[seed_item] = max(0, ai.stock.get(seed_item, 0) - 1)
             return
 
         plant = crop.get(PlantComponent)
         if not plant:
             return
         if plant.harvested:
-            plant._regrow_timer = max(0.0, plant._regrow_timer - 18.0)
+            crop.destroy()
+            plot["crop"] = None
             return
         if plant.growth_stage < GROWTH_FULL:
             plant.growth_stage = min(GROWTH_FULL, plant.growth_stage + 1)
             return
         if plant.harvest():
-            for item_id, qty in self._roll_loot("berry_bush"):
+            for item_id, qty in self._roll_loot(plot["plant_type"]):
                 ai.stock[item_id] = ai.stock.get(item_id, 0) + qty
+            crop.destroy()
+            plot["crop"] = None
+
+    def _farmer_needs_seed_refill(self, ai):
+        needed_seed_types = {plot["seed_item"] for plot in getattr(ai, "farm_plots", [])}
+        needs_food = ai.hunger < VILLAGER_EAT_THRESHOLD and ai.stock.get("bread", 0) < 1 and ai.stock.get("berry", 0) < 1
+        return needs_food or any(ai.stock.get(seed_item, 0) < 2 for seed_item in needed_seed_types)
 
     def _farmer_should_store(self, ai):
-        return ai.stock.get("berry", 0) >= 6 or ai.stock.get("berry_seed", 0) >= 8 or ai.stock.get("fiber", 0) >= 8
+        return (
+            ai.stock.get("berry", 0) >= 6
+            or ai.stock.get("wheat", 0) >= 6
+            or ai.stock.get("berry_seed", 0) >= 8
+            or ai.stock.get("wheat_seed", 0) >= 8
+            or ai.stock.get("fiber", 0) >= 8
+        )
+
+    def _withdraw_farmer_supplies(self, ai):
+        chest = getattr(ai, "storage_chest", None)
+        if not chest or not chest.alive:
+            return
+        container = chest.get(Container)
+        if not container:
+            return
+        for seed_item in sorted({plot["seed_item"] for plot in getattr(ai, "farm_plots", [])}):
+            need = max(0, 4 - ai.stock.get(seed_item, 0))
+            if need > 0:
+                ai.stock[seed_item] = ai.stock.get(seed_item, 0) + self._take_from_container(container, seed_item, need)
+        if ai.hunger < VILLAGER_EAT_THRESHOLD:
+            ai.stock["bread"] = ai.stock.get("bread", 0) + self._take_from_container(container, "bread", 1)
+            if ai.stock.get("bread", 0) < 1:
+                ai.stock["berry"] = ai.stock.get("berry", 0) + self._take_from_container(container, "berry", 2)
+
+    def _crafter_needs_supplies(self, ai):
+        return (
+            ai.stock.get("wheat", 0) < 3
+            or ai.stock.get("wood", 0) < 3
+            or ai.stock.get("stone", 0) < 2
+            or ai.stock.get("fiber", 0) < 2
+            or (ai.hunger < VILLAGER_EAT_THRESHOLD and ai.stock.get("bread", 0) < 1)
+        )
+
+    def _withdraw_crafter_supplies(self, ai):
+        chest = getattr(ai, "storage_chest", None)
+        if not chest or not chest.alive:
+            return
+        container = chest.get(Container)
+        if not container:
+            return
+        for item_id, target_qty in (("wheat", 4), ("wood", 5), ("stone", 4), ("fiber", 4)):
+            need = max(0, target_qty - ai.stock.get(item_id, 0))
+            if need > 0:
+                ai.stock[item_id] = ai.stock.get(item_id, 0) + self._take_from_container(container, item_id, need)
+        if ai.hunger < VILLAGER_EAT_THRESHOLD:
+            ai.stock["bread"] = ai.stock.get("bread", 0) + self._take_from_container(container, "bread", 1)
+            if ai.stock.get("bread", 0) < 1:
+                ai.stock["berry"] = ai.stock.get("berry", 0) + self._take_from_container(container, "berry", 2)
+
+    def _crafter_should_store(self, ai):
+        return (
+            ai.stock.get("bread", 0) >= 2
+            or ai.stock.get("rope", 0) >= 2
+            or ai.stock.get("hoe_wood", 0) >= 2
+            or ai.stock.get("sword_wood", 0) >= 1
+        )
+
+    def _deposit_crafter_stock(self, ai):
+        chest = getattr(ai, "storage_chest", None)
+        if not chest or not chest.alive:
+            return
+        container = chest.get(Container)
+        if not container:
+            return
+        reserve_targets = {"bread": 1, "rope": 1, "hoe_wood": 1, "sword_wood": 0}
+        for item_id, keep_qty in reserve_targets.items():
+            qty = ai.stock.get(item_id, 0) - keep_qty
+            if qty <= 0:
+                continue
+            leftover = self._add_to_container(container, item_id, qty)
+            ai.stock[item_id] = keep_qty + leftover
 
     def _deposit_farmer_stock(self, ai):
         chest = getattr(ai, "storage_chest", None)
@@ -1323,7 +1879,7 @@ class Game:
         container = chest.get(Container)
         if not container:
             return
-        for item_id in ("berry", "berry_seed", "fiber"):
+        for item_id in ("berry", "wheat", "berry_seed", "wheat_seed", "fiber"):
             qty = ai.stock.get(item_id, 0)
             if qty <= 0:
                 continue
@@ -1350,6 +1906,50 @@ class Game:
                 if qty == 0:
                     return 0
         return qty
+
+    def _take_from_container(self, container, item_id, qty):
+        taken = 0
+        for index, slot in enumerate(container.inventory):
+            if not slot or slot.item_id != item_id:
+                continue
+            move = min(qty - taken, slot.qty)
+            slot.qty -= move
+            taken += move
+            if slot.qty <= 0:
+                container.inventory[index] = None
+            if taken >= qty:
+                break
+        return taken
+
+    def _spawn_trade_popup(self, entity, item_id, qty, positive=True):
+        transform = entity.get(Transform) if entity else None
+        if not transform:
+            return
+        self.trade_popups.append({
+            "entity": entity,
+            "item_id": item_id,
+            "qty": qty,
+            "positive": positive,
+            "ttl": 1.0,
+            "duration": 1.0,
+            "rise": 0.0,
+            "drift_x": random.randint(-12, 12),
+            "world_pos": pygame.Vector2(transform.x, transform.y),
+        })
+
+    def _update_trade_popups(self, dt):
+        active = []
+        for popup in self.trade_popups:
+            popup["ttl"] -= dt
+            popup["rise"] += dt * 26
+            entity = popup.get("entity")
+            if entity and entity.alive:
+                transform = entity.get(Transform)
+                if transform:
+                    popup["world_pos"] = pygame.Vector2(transform.x, transform.y)
+            if popup["ttl"] > 0:
+                active.append(popup)
+        self.trade_popups = active
 
     def _entity_tile(self, transform):
         return (
@@ -1423,7 +2023,7 @@ class Game:
         return path
 
     def _update_structures(self):
-        for entity in self.world.with_component(StructureComponent):
+        for entity in self._cached_structure_entities:
             structure = entity.get(StructureComponent)
             renderer = entity.get(SpriteRenderer)
             transform = entity.get(Transform)
@@ -1440,6 +2040,7 @@ class Game:
                             break
                     if not keep_open:
                         structure.is_open = False
+                        self._structure_cache_dirty = True
                 renderer.alpha = 180 if structure.is_open else 255
 
     def _handle_pickups(self):
@@ -1448,7 +2049,7 @@ class Game:
         keys = pygame.key.get_pressed()
         player_pos = pygame.Vector2(player_transform.x + PLAYER_FOOTPRINT / 2, player_transform.y + PLAYER_FOOTPRINT - 16)
 
-        for entity in self.world.with_component(DroppedItem):
+        for entity in self._cached_drops:
             item = entity.get(DroppedItem)
             transform = entity.get(Transform)
             drop_pos = pygame.Vector2(transform.x + 10, transform.y + 10)
@@ -1517,6 +2118,44 @@ class Game:
             return family == "pickaxe"
         return stack.item_id.startswith("pickaxe_")
 
+    def _close_inventory_views(self):
+        self.show_inventory = False
+        self.show_crafting = False
+        self.craft_search_active = False
+        self._close_open_container()
+
+    def _close_open_container(self):
+        if self.open_container_entity and self.open_container_entity.alive:
+            container = self.open_container_entity.get(Container)
+            if container:
+                container.opened = False
+        self.open_container_entity = None
+
+    def _open_container(self, entity):
+        container = entity.get(Container)
+        if not container:
+            return
+        container.opened = True
+        self.open_container_entity = entity
+        self.show_inventory = True
+        self.show_crafting = False
+        self.craft_search_active = False
+
+    def _container_is_accessible(self, entity):
+        if not entity or not entity.alive:
+            return False
+        player_transform = self.player.get(Transform)
+        target_transform = entity.get(Transform)
+        if not player_transform or not target_transform:
+            return False
+        player_pos = pygame.Vector2(player_transform.x + PLAYER_FOOTPRINT / 2, player_transform.y + PLAYER_FOOTPRINT - 16)
+        target_pos = pygame.Vector2(target_transform.x + TILE_SIZE / 2, target_transform.y + TILE_SIZE / 2)
+        return player_pos.distance_to(target_pos) <= INTERACTION_RANGE + 18
+
+    def _sync_open_container(self):
+        if self.open_container_entity and (not self.show_inventory or not self._container_is_accessible(self.open_container_entity)):
+            self._close_open_container()
+
     def _update_interactions(self):
         player_transform = self.player.get(Transform)
         keys = pygame.key.get_pressed()
@@ -1526,7 +2165,7 @@ class Game:
         trader = None
         trader_dist = INTERACTION_RANGE
 
-        for entity in self.world.with_component(Interactable):
+        for entity in self._cached_interactables:
             interact = entity.get(Interactable)
             transform = entity.get(Transform)
             plant = entity.get(PlantComponent)
@@ -1545,7 +2184,7 @@ class Game:
             if structure and structure.openable and distance <= INTERACTION_RANGE:
                 self.harvest_hint = "E toggle door"
 
-        for entity in self.world.with_component(AIController):
+        for entity in self._cached_npcs:
             ai = entity.get(AIController)
             if ai.ai_type not in {"villager_farmer", "villager_crafter", "police"}:
                 continue
@@ -1572,12 +2211,28 @@ class Game:
         interact = nearest.get(Interactable)
         plant = nearest.get(PlantComponent)
         structure = nearest.get(StructureComponent)
+        container = nearest.get(Container)
+
+        if container:
+            chest_open = nearest is self.open_container_entity
+            self.harvest_hint = "E close chest" if chest_open else "E open chest"
+            if keys[pygame.K_e] and self.instant_interact_cooldown <= 0:
+                if chest_open:
+                    self._close_open_container()
+                    self._set_message("Chest closed")
+                else:
+                    self._open_container(nearest)
+                    self._set_message("Chest opened")
+                self.instant_interact_cooldown = 0.25
+            return
 
         if structure and structure.openable:
             self.harvest_hint = "E toggle door"
-            if keys[pygame.K_e]:
+            if keys[pygame.K_e] and self.instant_interact_cooldown <= 0:
                 structure.toggle()
+                self._structure_cache_dirty = True
                 self._set_message("Door opened" if structure.is_open else "Door closed")
+                self.instant_interact_cooldown = 0.18
             return
 
         label = interact.label
@@ -1678,11 +2333,33 @@ class Game:
         self._set_message(f"Defeated a {ai.ai_type} creature")
 
     def _spawn_drop(self, item_id, qty, x, y):
+        for entity in self._cached_drops:
+            if not entity.alive:
+                continue
+            drop = entity.get(DroppedItem)
+            transform = entity.get(Transform)
+            if not drop or not transform or drop.item_id != item_id:
+                continue
+            if pygame.Vector2(transform.x, transform.y).distance_to((x, y)) <= 28:
+                drop.qty += qty
+                drop._despawn_timer = DROP_DESPAWN_TIME
+                return
+
+        if len(self._cached_drops) >= WORLD_DROP_LIMIT and self._cached_drops:
+            oldest = min(
+                (entity for entity in self._cached_drops if entity.alive),
+                key=lambda entity: entity.get(DroppedItem)._despawn_timer,
+                default=None,
+            )
+            if oldest:
+                oldest.destroy()
+
         entity = Entity(f"drop_{item_id}")
         entity.tags.add("drop")
         entity.add(Transform(x, y))
         entity.add(DroppedItem(item_id, qty))
         self.world.add(entity)
+        self._cached_drops.append(entity)
 
     def _world_mouse_tile(self):
         mx, my = pygame.mouse.get_pos()
@@ -1837,15 +2514,23 @@ class Game:
         filtered = self._filtered_recipe_order()
         if not filtered:
             self.selected_recipe_index = 0
+            self.recipe_scroll_offset = 0
         else:
             self.selected_recipe_index = max(0, min(self.selected_recipe_index, len(filtered) - 1))
+            visible_count = 8
+            max_offset = max(0, len(filtered) - visible_count)
+            self.recipe_scroll_offset = max(0, min(self.recipe_scroll_offset, max_offset))
+            if self.selected_recipe_index < self.recipe_scroll_offset:
+                self.recipe_scroll_offset = self.selected_recipe_index
+            elif self.selected_recipe_index >= self.recipe_scroll_offset + visible_count:
+                self.recipe_scroll_offset = self.selected_recipe_index - visible_count + 1
 
     def _station_nearby(self, station_name):
         if station_name is None:
             return True
         player_transform = self.player.get(Transform)
         player_pos = pygame.Vector2(player_transform.x + PLAYER_FOOTPRINT / 2, player_transform.y + PLAYER_FOOTPRINT - 16)
-        for entity in self.world.with_component(StructureComponent):
+        for entity in self._cached_structure_entities:
             structure = entity.get(StructureComponent)
             if structure.station != station_name:
                 continue
@@ -1899,6 +2584,7 @@ class Game:
         self.recipe_click_refs = []
         self.craft_output_rect = None
         self.inventory_panel_rect = None
+        self.container_panel_rect = None
         self.craft_search_rect = None
         self.hover_stack = None
         self.screen.fill(COL_BG)
@@ -1910,7 +2596,7 @@ class Game:
 
     def _draw_entities(self):
         drawables = []
-        for entity in self.world.all():
+        for entity in self._cached_all_entities:
             transform = entity.get(Transform)
             renderer = entity.get(SpriteRenderer)
             if renderer and transform:
@@ -1972,10 +2658,14 @@ class Game:
                         )
                     else:
                         renderer.draw(self.screen, screen_x, screen_y)
+                ai = entity.get(AIController)
+                if ai and getattr(ai, "sleeping", False):
+                    self._draw_sleep_indicator(screen_x, screen_y)
 
         self._draw_attack_ring()
         self._draw_held_item()
         self._draw_interaction_progress()
+        self._draw_trade_popups()
 
     def _draw_player_fallback(self, screen_x, screen_y):
         self._draw_humanoid_fallback(
@@ -2148,6 +2838,38 @@ class Game:
         pygame.draw.rect(self.screen, COL_BLACK, outer)
         pygame.draw.rect(self.screen, COL_HUNGER_BAR, inner)
 
+    def _draw_trade_popups(self):
+        for popup in self.trade_popups:
+            ratio = max(0.0, min(1.0, popup["ttl"] / popup["duration"]))
+            alpha = int(255 * ratio)
+            color = COL_GREEN if popup["positive"] else COL_RED
+            text = self.small_font.render(f"{'+' if popup['positive'] else '-'}{popup['qty']}", True, color)
+            text.set_alpha(alpha)
+            world_pos = popup["world_pos"]
+            screen_x = int(world_pos.x - self.camera_x + 18 + popup["drift_x"])
+            screen_y = int(world_pos.y - self.camera_y - 20 - popup["rise"])
+            bg = pygame.Surface((text.get_width() + 26, max(18, text.get_height()) + 6), pygame.SRCALPHA)
+            bg.fill((18, 22, 18, min(180, alpha)))
+            self.screen.blit(bg, (screen_x - 8, screen_y - 2))
+            icon = self._item_icon(popup["item_id"], (14, 14))
+            if icon:
+                icon = icon.copy()
+                icon.set_alpha(alpha)
+                self.screen.blit(icon, (screen_x - 4, screen_y + 1))
+            else:
+                icon_rect = pygame.Rect(screen_x - 4, screen_y + 1, 14, 14)
+                pygame.draw.rect(self.screen, ITEMS.get(popup["item_id"], {}).get("color", COL_WHITE), icon_rect, border_radius=3)
+                pygame.draw.rect(self.screen, COL_BLACK, icon_rect, 1, border_radius=3)
+            self.screen.blit(text, (screen_x + 14, screen_y))
+
+    def _draw_sleep_indicator(self, screen_x, screen_y):
+        text = self.small_font.render("Zz", True, COL_WHITE)
+        shadow = self.small_font.render("Zz", True, COL_BLACK)
+        x = screen_x + 18
+        y = screen_y - 12
+        self.screen.blit(shadow, (x + 1, y + 1))
+        self.screen.blit(text, (x, y))
+
     def _draw_day_night_overlay(self):
         if not self._is_night():
             return
@@ -2162,7 +2884,10 @@ class Game:
         self._draw_minimap_hint()
         if self.show_inventory:
             self._draw_inventory_panel()
-            self._draw_crafting_panel(linked=True)
+            if self.open_container_entity:
+                self._draw_container_panel()
+            else:
+                self._draw_crafting_panel(linked=True)
         if self.message_timer > 0:
             self._draw_message()
         if self.selected_item_label_timer > 0 and self.selected_item_label:
@@ -2243,6 +2968,39 @@ class Game:
         self.screen.blit(self.small_font.render("Left click moves stacks. Right click places blocks. E toggles doors.", True, COL_UI_TEXT),
                          (panel.x + 16, panel.bottom - 20))
 
+    def _draw_container_panel(self):
+        if not self.open_container_entity or not self.open_container_entity.alive:
+            self._close_open_container()
+            return
+        container = self.open_container_entity.get(Container)
+        if not container or not self.inventory_panel_rect:
+            return
+
+        cols = 6 if len(container.inventory) > 16 else 4
+        rows = math.ceil(len(container.inventory) / cols)
+        panel_w = cols * (SLOT_SIZE + SLOT_PADDING) + SLOT_PADDING * 2 + 28
+        panel_h = rows * (SLOT_SIZE + SLOT_PADDING) + SLOT_PADDING * 2 + 88
+        panel = pygame.Rect(self.inventory_panel_rect.right + 16, self.inventory_panel_rect.y + 18, panel_w, panel_h)
+        self.container_panel_rect = panel
+        self._draw_panel(panel, "Village Chest")
+        self.screen.blit(self.small_font.render("Shared village storage", True, COL_UI_TEXT), (panel.x + 16, panel.y + 42))
+
+        start_x = panel.x + 16
+        start_y = panel.y + 70
+        for index, stack in enumerate(container.inventory):
+            col = index % cols
+            row = index // cols
+            rect = pygame.Rect(start_x + col * (SLOT_SIZE + SLOT_PADDING), start_y + row * (SLOT_SIZE + SLOT_PADDING), SLOT_SIZE, SLOT_SIZE)
+            self._draw_minecraft_slot(rect)
+            self.mouse_slot_refs.append((rect, (container.inventory, index)))
+            if stack:
+                self._draw_stack(rect, stack)
+                if rect.collidepoint(pygame.mouse.get_pos()):
+                    self.hover_stack = stack
+
+        self.screen.blit(self.small_font.render("Left click moves stacks between inventories.", True, COL_UI_TEXT),
+                         (panel.x + 16, panel.bottom - 20))
+
     def _draw_crafting_panel(self, linked=False):
         filtered = self._filtered_recipe_order()
         self._clamp_recipe_selection()
@@ -2267,18 +3025,26 @@ class Game:
         pygame.draw.rect(self.screen, COL_UI_BORDER, list_rect, 2)
 
         list_y = list_rect.y + 8
-        visible = filtered[:8]
+        visible = filtered[self.recipe_scroll_offset:self.recipe_scroll_offset + 8]
         for idx, rid in enumerate(visible):
             recipe_rect = pygame.Rect(list_rect.x + 6, list_y + idx * 44, list_rect.width - 12, 38)
-            selected = idx == self.selected_recipe_index
+            absolute_index = self.recipe_scroll_offset + idx
+            selected = absolute_index == self.selected_recipe_index
             pygame.draw.rect(self.screen, COL_UI_SELECTED if selected else COL_BG, recipe_rect)
             pygame.draw.rect(self.screen, COL_UI_BORDER, recipe_rect, 2)
             color = COL_WHITE if self._can_craft(RECIPES[rid]) else COL_UI_TEXT
             self.screen.blit(self.small_font.render(RECIPES[rid]["name"], True, color), (recipe_rect.x + 8, recipe_rect.y + 10))
-            self.recipe_click_refs.append((recipe_rect, idx))
+            self.recipe_click_refs.append((recipe_rect, absolute_index))
 
         if not visible:
             self.screen.blit(self.small_font.render("No matching recipes", True, COL_UI_TEXT), (list_rect.x + 12, list_rect.y + 12))
+        elif len(filtered) > len(visible):
+            page_text = self.small_font.render(
+                f"{self.recipe_scroll_offset + 1}-{self.recipe_scroll_offset + len(visible)} / {len(filtered)}",
+                True,
+                COL_UI_TEXT,
+            )
+            self.screen.blit(page_text, (list_rect.x + 8, list_rect.bottom - page_text.get_height() - 6))
 
         preview_x = list_rect.right + 22
         preview_y = panel.y + 86

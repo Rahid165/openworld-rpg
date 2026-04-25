@@ -382,6 +382,33 @@ class AIController(Component):
         self.path: List[Tuple[int, int]] = []
         self.path_recalc_timer = 0.0
         self.path_index = 0
+        self.role = ai_type
+        self.village_id = None
+        self.display_name = ai_type
+        self.stock: Dict[str, int] = {}
+        self.trade_offer = ""
+        self.activity_timer = 0.0
+        self.trade_timer = 0.0
+        self.home_radius = TILE_SIZE * 8
+        self.sleep_path: List[pygame.Vector2] = []
+        self.sleep_path_index = 0
+        self.home_bounds = None
+        self.sleeping = False
+        self.farm_plots = []
+        self.work_points: List[pygame.Vector2] = []
+        self.work_index = 0
+        self.storage_chest = None
+        self.max_hunger = 0.0
+        self.hunger = 0.0
+        self.hunger_drain = 0.0
+        self.trade_partner = None
+        self.trade_task = None
+        self.village_bounds = None
+        self.work_pause_range = (0.4, 1.0)
+        self.idle_route = []
+        self.route_pause_timer = 0.0
+        self.last_pos = pygame.Vector2()
+        self.stuck_timer = 0.0
 
     def update(self, dt: float):
         self.state_timer -= dt
@@ -389,9 +416,29 @@ class AIController(Component):
             self._attack_cooldown -= dt
         if self.path_recalc_timer > 0:
             self.path_recalc_timer -= dt
+        if self.hunger_drain > 0 and self.max_hunger > 0:
+            self.hunger = max(0.0, self.hunger - self.hunger_drain * dt)
+            if self.hunger == 0:
+                health = self.entity.get(Health)
+                if health:
+                    health.damage(1.5 * dt)
+        if self.route_pause_timer > 0:
+            self.route_pause_timer -= dt
+        if self.stuck_timer > 0:
+            self.stuck_timer = max(0.0, self.stuck_timer - dt * 0.25)
 
         # State machine handled by NPCSystem (needs world reference)
         # Just tick timers here
+
+    def hunger_ratio(self) -> float:
+        if self.max_hunger <= 0:
+            return 1.0
+        return max(0.0, min(1.0, self.hunger / self.max_hunger))
+
+    def eat(self, food_restore: float):
+        if self.max_hunger <= 0:
+            return
+        self.hunger = min(self.max_hunger, self.hunger + food_restore)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,7 +531,7 @@ class DroppedItem(Component):
         self.qty     = qty
         self._bob_timer = random.uniform(0, math.pi * 2)
         self._bob_y     = 0.0
-        self._despawn_timer = 180.0   # seconds until despawn
+        self._despawn_timer = DROP_DESPAWN_TIME
 
     def update(self, dt: float):
         self._bob_timer += dt * 2.5
