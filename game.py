@@ -34,7 +34,18 @@ class Game:
         self.font = pygame.font.SysFont("consolas", 18)
         self.small_font = pygame.font.SysFont("consolas", 14)
         self.big_font = pygame.font.SysFont("consolas", 28, bold=True)
+        self.asset_cache = {}
+        self.sprite_path_cache = {}
+        self.last_seed = random.randint(1000, 999999)
+        self.npc_profiles = self._build_npc_profiles()
+        self.game_mode = "main_menu"
+        self.menu_seed_text = str(self.last_seed)
+        self.menu_buttons = {}
+        self._reset_game_world(self.last_seed)
 
+    def _reset_game_world(self, seed=None):
+        if seed is not None:
+            self.last_seed = seed
         self.show_inventory = False
         self.show_crafting = False
         self.message = "WASD move  SHIFT sprint  SPACE attack  E interact  Right click place"
@@ -53,8 +64,6 @@ class Game:
         self.craft_search_rect = None
         self.pending_attack = False
         self.attack_cooldown = 0.0
-        self.asset_cache = {}
-        self.sprite_path_cache = {}
         self.craft_output_rect = None
         self.inventory_panel_rect = None
         self.hover_stack = None
@@ -62,7 +71,6 @@ class Game:
         self.container_panel_rect = None
         self.selected_item_label = ""
         self.selected_item_label_timer = 0.0
-        self.last_seed = random.randint(1000, 999999)
         self.time_of_day = 0.30
         self.day_cycle_speed = 1 / 240.0
         self.zombie_spawn_timer = 4.0
@@ -80,10 +88,12 @@ class Game:
         self._cached_openable_doors = []
         self._cached_drops = []
         self._cached_interactables = []
+        self._cached_colliders = []
         self._cached_solid_structure_colliders = []
         self._cached_solid_structure_rects = []
+        self._cached_blocked_tiles = set()
+        self._cached_structure_positions = set()
         self._structure_cache_dirty = True
-        self.npc_profiles = self._build_npc_profiles()
 
         self.tilemap = self._create_world()
         self.world = EntityManager()
@@ -93,9 +103,48 @@ class Game:
         self._spawn_villages()
         self._spawn_npcs()
         self._update_camera(force_center=True)
+        self._refresh_frame_caches()
 
     def _create_world(self):
         return MapGenerator(self.last_seed).generate(MAP_WIDTH, MAP_HEIGHT)
+
+    def _player_is_dead(self):
+        health = getattr(self, "player", None).get(Health) if hasattr(self, "player") else None
+        return bool(health and health.hp <= 0)
+
+    def _start_or_restart_game(self, seed=None):
+        if seed is None:
+            seed = self.last_seed
+        self.menu_seed_text = str(seed)
+        self._reset_game_world(seed)
+        self.game_mode = "playing"
+
+    def _return_to_main_menu(self):
+        self.pending_attack = False
+        self.show_inventory = False
+        self.show_crafting = False
+        self._close_open_container()
+        self.game_mode = "main_menu"
+        self.message_timer = 0.0
+
+    def _toggle_pause(self):
+        if self.game_mode == "playing":
+            self.pending_attack = False
+            self.game_mode = "paused"
+            self._close_inventory_views()
+        elif self.game_mode == "paused":
+            self.game_mode = "playing"
+
+    def _menu_seed_value(self):
+        text = self.menu_seed_text.strip()
+        if not text:
+            return random.randint(1000, 999999)
+        return max(0, min(999999999, int(text)))
+
+    def _set_dead_state(self):
+        self.pending_attack = False
+        self._close_inventory_views()
+        self.game_mode = "dead"
 
     def _build_npc_profiles(self):
         return {
@@ -215,6 +264,7 @@ class Game:
         openable_doors = []
         drops = []
         interactables = []
+        colliders = []
 
         for entity in all_entities:
             ai = entity.get(AIController)
@@ -232,6 +282,8 @@ class Game:
                 drops.append(entity)
             if entity.get(Interactable):
                 interactables.append(entity)
+            if entity.get(Collider):
+                colliders.append(entity)
 
         if self.player.alive:
             self._cached_combatants.append(self.player)
@@ -243,20 +295,34 @@ class Game:
         self._cached_openable_doors = openable_doors
         self._cached_drops = drops
         self._cached_interactables = interactables
+        self._cached_colliders = colliders
         if self._structure_cache_dirty:
             self._rebuild_structure_collision_cache()
 
     def _rebuild_structure_collision_cache(self):
         self._cached_solid_structure_colliders = []
         self._cached_solid_structure_rects = []
+        self._cached_blocked_tiles = set()
+        self._cached_structure_positions = set()
         for entity in self._cached_structure_entities:
             if not entity.alive:
                 continue
             structure = entity.get(StructureComponent)
+            transform = entity.get(Transform)
             collider = entity.get(Collider)
+            if structure and transform:
+                self._cached_structure_positions.add((int(transform.x), int(transform.y)))
             if structure and collider and structure.blocks_movement():
+                rect = collider.get_rect()
                 self._cached_solid_structure_colliders.append(collider)
-                self._cached_solid_structure_rects.append(collider.get_rect())
+                self._cached_solid_structure_rects.append(rect)
+                left = rect.left // TILE_SIZE
+                right = (rect.right - 1) // TILE_SIZE
+                top = rect.top // TILE_SIZE
+                bottom = (rect.bottom - 1) // TILE_SIZE
+                for ty in range(top, bottom + 1):
+                    for tx in range(left, right + 1):
+                        self._cached_blocked_tiles.add((tx, ty))
         self._structure_cache_dirty = False
 
     def _current_npcs(self):
@@ -636,7 +702,8 @@ class Game:
 
     def _position_occupied(self, x, y, width, height):
         rect = pygame.Rect(int(x), int(y), width, height)
-        for entity in self.world.all():
+        collider_entities = self._cached_colliders if self._cached_colliders else self.world.all()
+        for entity in collider_entities:
             collider = entity.get(Collider)
             structure = entity.get(StructureComponent)
             if collider and (not structure or structure.blocks_movement()):
@@ -820,60 +887,130 @@ class Game:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            elif event.type == pygame.KEYDOWN:
-                if self.show_inventory and self.craft_search_active and event.key == pygame.K_BACKSPACE:
-                    self.craft_search_text = self.craft_search_text[:-1]
-                    self._clamp_recipe_selection()
-                    continue
-                if self.show_inventory and self.craft_search_active and event.unicode and event.unicode.isprintable() and not event.unicode.isspace():
-                    self.craft_search_text += event.unicode.lower()
-                    self._clamp_recipe_selection()
-                    continue
-                if event.key == pygame.K_ESCAPE:
-                    if self.show_inventory:
-                        self._close_inventory_views()
-                    else:
-                        self.running = False
-                elif event.key == pygame.K_i:
-                    self.show_inventory = not self.show_inventory
-                    self.show_crafting = self.show_inventory
-                    self.craft_search_active = self.show_inventory
-                    if not self.show_inventory:
-                        self._close_inventory_views()
-                    else:
-                        self.open_container_entity = None
-                elif pygame.K_1 <= event.key <= pygame.K_9:
-                    self.player.get(Inventory).selected_hotbar = event.key - pygame.K_1
-                    self._show_selected_item_name(self.player.get(Inventory).get_selected())
-                elif event.key == pygame.K_f:
-                    self._eat_selected_food()
-                elif event.key == pygame.K_q:
-                    self._drop_selected_item()
-                elif event.key == pygame.K_SPACE:
-                    self.pending_attack = True
-                elif event.key == pygame.K_RETURN:
-                    crafted = self._craft_selected_recipe()
-                    self._set_message(f"Crafted {crafted}" if crafted else "That recipe is not craftable yet")
-                elif event.key == pygame.K_UP:
-                    self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
-                    self._clamp_recipe_selection()
-                elif event.key == pygame.K_DOWN:
-                    self.selected_recipe_index += 1
-                    self._clamp_recipe_selection()
-                elif event.key == pygame.K_r:
-                    self.last_seed = random.randint(1000, 999999)
-                    self._set_message(f"Current generated map seed: {self.last_seed}")
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
-                    self._handle_left_click(event.pos)
-                elif event.button == 3 and not self.show_inventory:
-                    self._place_selected_structure()
-                elif event.button == 4:
-                    self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
-                    self._clamp_recipe_selection()
-                elif event.button == 5:
-                    self.selected_recipe_index += 1
-                    self._clamp_recipe_selection()
+                continue
+            if self.game_mode == "main_menu":
+                self._handle_main_menu_event(event)
+            elif self.game_mode == "paused":
+                self._handle_paused_event(event)
+            elif self.game_mode == "dead":
+                self._handle_dead_event(event)
+            else:
+                self._handle_gameplay_event(event)
+
+    def _handle_main_menu_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.running = False
+            elif event.key == pygame.K_RETURN:
+                self._start_or_restart_game(self._menu_seed_value())
+            elif event.key == pygame.K_BACKSPACE:
+                self.menu_seed_text = self.menu_seed_text[:-1]
+            elif event.key == pygame.K_r:
+                self.menu_seed_text = str(random.randint(1000, 999999))
+            elif event.unicode and event.unicode.isdigit():
+                self.menu_seed_text = (self.menu_seed_text + event.unicode)[:9]
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._handle_overlay_click(event.pos)
+
+    def _handle_paused_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key in {pygame.K_ESCAPE, pygame.K_p}:
+                self._toggle_pause()
+            elif event.key == pygame.K_r:
+                self._start_or_restart_game(self.last_seed)
+            elif event.key == pygame.K_m:
+                self._return_to_main_menu()
+            elif event.key == pygame.K_q:
+                self.running = False
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._handle_overlay_click(event.pos)
+
+    def _handle_dead_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key in {pygame.K_RETURN, pygame.K_r}:
+                self._start_or_restart_game(self.last_seed)
+            elif event.key == pygame.K_m:
+                self._return_to_main_menu()
+            elif event.key == pygame.K_q:
+                self.running = False
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._handle_overlay_click(event.pos)
+
+    def _handle_gameplay_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if self.show_inventory and self.craft_search_active and event.key == pygame.K_BACKSPACE:
+                self.craft_search_text = self.craft_search_text[:-1]
+                self._clamp_recipe_selection()
+                return
+            if self.show_inventory and self.craft_search_active and event.unicode and event.unicode.isprintable() and not event.unicode.isspace():
+                self.craft_search_text += event.unicode.lower()
+                self._clamp_recipe_selection()
+                return
+            if event.key == pygame.K_ESCAPE:
+                if self.show_inventory:
+                    self._close_inventory_views()
+                else:
+                    self._toggle_pause()
+            elif event.key == pygame.K_p:
+                self._toggle_pause()
+            elif event.key == pygame.K_i:
+                self.show_inventory = not self.show_inventory
+                self.show_crafting = self.show_inventory
+                self.craft_search_active = self.show_inventory
+                if not self.show_inventory:
+                    self._close_inventory_views()
+                else:
+                    self.open_container_entity = None
+            elif pygame.K_1 <= event.key <= pygame.K_9:
+                self.player.get(Inventory).selected_hotbar = event.key - pygame.K_1
+                self._show_selected_item_name(self.player.get(Inventory).get_selected())
+            elif event.key == pygame.K_f:
+                self._eat_selected_food()
+            elif event.key == pygame.K_q:
+                self._drop_selected_item()
+            elif event.key == pygame.K_SPACE and not self._player_is_dead():
+                self.pending_attack = True
+            elif event.key == pygame.K_RETURN:
+                crafted = self._craft_selected_recipe()
+                self._set_message(f"Crafted {crafted}" if crafted else "That recipe is not craftable yet")
+            elif event.key == pygame.K_UP:
+                self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
+                self._clamp_recipe_selection()
+            elif event.key == pygame.K_DOWN:
+                self.selected_recipe_index += 1
+                self._clamp_recipe_selection()
+            elif event.key == pygame.K_r:
+                self.last_seed = random.randint(1000, 999999)
+                self.menu_seed_text = str(self.last_seed)
+                self._set_message(f"Current generated map seed: {self.last_seed}")
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self._handle_left_click(event.pos)
+            elif event.button == 3 and not self.show_inventory and not self._player_is_dead():
+                self._place_selected_structure()
+            elif event.button == 4:
+                self.selected_recipe_index = max(0, self.selected_recipe_index - 1)
+                self._clamp_recipe_selection()
+            elif event.button == 5:
+                self.selected_recipe_index += 1
+                self._clamp_recipe_selection()
+
+    def _handle_overlay_click(self, pos):
+        for action, rect in self.menu_buttons.items():
+            if rect.collidepoint(pos):
+                if action == "start":
+                    self._start_or_restart_game(self._menu_seed_value())
+                elif action == "random_seed":
+                    self.menu_seed_text = str(random.randint(1000, 999999))
+                elif action == "resume":
+                    self._toggle_pause()
+                elif action == "restart":
+                    self._start_or_restart_game(self.last_seed)
+                elif action == "main_menu":
+                    self._return_to_main_menu()
+                elif action == "quit":
+                    self.running = False
+                break
 
     def _update(self, dt):
         self.message_timer = max(0.0, self.message_timer - dt)
@@ -882,6 +1019,11 @@ class Game:
         self.instant_interact_cooldown = max(0.0, self.instant_interact_cooldown - dt)
         self.trade_interact_cooldown = max(0.0, self.trade_interact_cooldown - dt)
         self.harvest_hint = ""
+        if self.game_mode == "playing" and self._player_is_dead():
+            self._set_dead_state()
+        if self.game_mode != "playing":
+            self.pending_attack = False
+            return
         self._update_trade_popups(dt)
         self._sync_open_container()
         self._refresh_frame_caches()
@@ -889,6 +1031,9 @@ class Game:
         self._update_player(dt)
         self._update_npcs(dt)
         self.world.update(dt)
+        if self._player_is_dead():
+            self._set_dead_state()
+            return
         self._update_structures()
         self._handle_pickups()
         self._update_interactions()
@@ -909,6 +1054,10 @@ class Game:
         stats = self.player.get(PlayerStats)
         health = self.player.get(Health)
 
+        if health.hp <= 0:
+            self.pending_attack = False
+            return
+
         move = pygame.Vector2(
             float(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - float(keys[pygame.K_a] or keys[pygame.K_LEFT]),
             float(keys[pygame.K_s] or keys[pygame.K_DOWN]) - float(keys[pygame.K_w] or keys[pygame.K_UP]),
@@ -918,8 +1067,6 @@ class Game:
         sprinting = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]) and move.length_squared() > 0
         stats.set_sprint(sprinting)
         speed = PLAYER_SPEED * (SPRINT_MULT if stats.is_sprinting() else 1.0)
-        if health.hp <= 0:
-            speed = 0
         self._move_entity(transform, collider, move.x * speed * dt, move.y * speed * dt)
 
         if self.pending_attack and self.attack_cooldown <= 0:
@@ -955,6 +1102,9 @@ class Game:
         return False
 
     def _player_attack(self):
+        if self._player_is_dead():
+            self.pending_attack = False
+            return
         inventory = self.player.get(Inventory)
         selected = inventory.get_selected()
         damage = 8
@@ -1982,11 +2132,7 @@ class Game:
     def _tile_is_blocked(self, tx, ty):
         if self.tilemap.is_solid(tx, ty):
             return True
-        tile_rect = pygame.Rect(tx * TILE_SIZE, ty * TILE_SIZE, TILE_SIZE, TILE_SIZE)
-        for structure_rect in self._solid_structure_rects():
-            if structure_rect.colliderect(tile_rect):
-                return True
-        return False
+        return (tx, ty) in self._cached_blocked_tiles
 
     def _find_path(self, start, goal):
         if start == goal:
@@ -2399,6 +2545,7 @@ class Game:
 
         structure = self._create_structure(placeable, x, y)
         self.world.add(structure)
+        self._structure_cache_dirty = True
         selected.qty -= 1
         if selected.qty <= 0:
             inventory.hotbar[inventory.selected_hotbar] = None
@@ -2417,13 +2564,11 @@ class Game:
         if self.tilemap.get(tx, ty) not in {TILE_GRASS, TILE_DIRT}:
             self._set_message("Hoes work on grass or dirt")
             return
-        for entity in self.world.with_component(StructureComponent):
-            structure = entity.get(StructureComponent)
-            transform = entity.get(Transform)
-            if structure and transform and int(transform.x) == x and int(transform.y) == y:
-                self._set_message("That tile is already occupied")
-                return
+        if (x, y) in self._cached_structure_positions:
+            self._set_message("That tile is already occupied")
+            return
         self.world.add(self._create_structure("farmland", x, y))
+        self._structure_cache_dirty = True
         if selected.durability is not None:
             self.player.get(Inventory).use_durability(1)
         self._set_message("Tilled farmland")
@@ -2582,6 +2727,7 @@ class Game:
     def _draw(self):
         self.mouse_slot_refs = []
         self.recipe_click_refs = []
+        self.menu_buttons = {}
         self.craft_output_rect = None
         self.inventory_panel_rect = None
         self.container_panel_rect = None
@@ -2596,12 +2742,24 @@ class Game:
 
     def _draw_entities(self):
         drawables = []
+        view_rect = pygame.Rect(int(self.camera_x) - 96, int(self.camera_y) - 128, SCREEN_WIDTH + 192, SCREEN_HEIGHT + 256)
         for entity in self._cached_all_entities:
             transform = entity.get(Transform)
             renderer = entity.get(SpriteRenderer)
             if renderer and transform:
+                world_rect = pygame.Rect(int(transform.x), int(transform.y), renderer.width, renderer.height)
+                if "player" in entity.tags:
+                    world_rect.x += (PLAYER_FOOTPRINT - renderer.width) // 2
+                    world_rect.y -= (renderer.height - PLAYER_FOOTPRINT)
+                elif "tree" in entity.tags:
+                    world_rect.x += (TREE_FOOTPRINT - renderer.width) // 2
+                    world_rect.y -= (renderer.height - TREE_FOOTPRINT)
+                if not view_rect.colliderect(world_rect):
+                    continue
                 drawables.append((renderer.layer, transform.y + TILE_SIZE, entity))
             elif entity.has(DroppedItem):
+                if not view_rect.colliderect(pygame.Rect(int(transform.x), int(transform.y), 32, 32)):
+                    continue
                 drawables.append((LAYER_ITEMS, transform.y, entity))
         drawables.sort(key=lambda entry: (entry[0], entry[1]))
 
@@ -2879,29 +3037,43 @@ class Game:
         self.screen.blit(overlay, (0, 0))
 
     def _draw_ui(self):
-        self._draw_stat_bars()
-        self._draw_hotbar()
-        self._draw_minimap_hint()
-        if self.show_inventory:
-            self._draw_inventory_panel()
-            if self.open_container_entity:
-                self._draw_container_panel()
-            else:
-                self._draw_crafting_panel(linked=True)
-        if self.message_timer > 0:
-            self._draw_message()
-        if self.selected_item_label_timer > 0 and self.selected_item_label:
-            self._draw_selected_item_label()
-        if self.harvest_hint:
-            text = self.font.render(self.harvest_hint, True, COL_WHITE)
-            bg = pygame.Surface((text.get_width() + 16, text.get_height() + 10), pygame.SRCALPHA)
-            bg.fill(COL_UI_BG)
-            self.screen.blit(bg, (SCREEN_WIDTH // 2 - bg.get_width() // 2, SCREEN_HEIGHT - 106))
-            self.screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, SCREEN_HEIGHT - 101))
-        if self.cursor_stack:
-            self._draw_cursor_stack()
-        if self.hover_stack:
-            self._draw_hover_tooltip(self.hover_stack)
+        if self.game_mode == "playing":
+            self._draw_stat_bars()
+            self._draw_hotbar()
+            self._draw_minimap_hint()
+            if self.show_inventory:
+                self._draw_inventory_panel()
+                if self.open_container_entity:
+                    self._draw_container_panel()
+                else:
+                    self._draw_crafting_panel(linked=True)
+            if self.message_timer > 0:
+                self._draw_message()
+            if self.selected_item_label_timer > 0 and self.selected_item_label:
+                self._draw_selected_item_label()
+            if self.harvest_hint:
+                text = self.font.render(self.harvest_hint, True, COL_WHITE)
+                bg = pygame.Surface((text.get_width() + 16, text.get_height() + 10), pygame.SRCALPHA)
+                bg.fill(COL_UI_BG)
+                self.screen.blit(bg, (SCREEN_WIDTH // 2 - bg.get_width() // 2, SCREEN_HEIGHT - 106))
+                self.screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, SCREEN_HEIGHT - 101))
+            if self.cursor_stack:
+                self._draw_cursor_stack()
+            if self.hover_stack:
+                self._draw_hover_tooltip(self.hover_stack)
+        elif self.game_mode in {"paused", "dead"}:
+            self._draw_stat_bars()
+            self._draw_hotbar()
+            self._draw_minimap_hint()
+            if self.message_timer > 0:
+                self._draw_message()
+
+        if self.game_mode == "main_menu":
+            self._draw_main_menu()
+        elif self.game_mode == "paused":
+            self._draw_pause_menu()
+        elif self.game_mode == "dead":
+            self._draw_death_menu()
 
     def _draw_stat_bars(self):
         stats = self.player.get(PlayerStats)
@@ -3214,6 +3386,81 @@ class Game:
             COL_UI_TEXT,
         )
         self.screen.blit(text, (16, SCREEN_HEIGHT - 28))
+
+    def _draw_main_menu(self):
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((8, 12, 10, 210))
+        self.screen.blit(overlay, (0, 0))
+
+        panel = pygame.Rect(SCREEN_WIDTH // 2 - 240, SCREEN_HEIGHT // 2 - 190, 480, 380)
+        self._draw_panel(panel, "Verdant Wilds")
+        subtitle = self.small_font.render("Choose a map seed, then start a new run.", True, COL_UI_TEXT)
+        self.screen.blit(subtitle, (panel.x + 22, panel.y + 46))
+
+        seed_rect = pygame.Rect(panel.x + 24, panel.y + 88, panel.width - 48, 42)
+        pygame.draw.rect(self.screen, COL_UI_SLOT, seed_rect, border_radius=4)
+        pygame.draw.rect(self.screen, COL_UI_SELECTED, seed_rect, 2, border_radius=4)
+        seed_label = self.font.render(self.menu_seed_text or "Random", True, COL_WHITE)
+        self.screen.blit(self.small_font.render("World Seed", True, COL_UI_TEXT), (seed_rect.x + 8, seed_rect.y - 18))
+        self.screen.blit(seed_label, (seed_rect.x + 12, seed_rect.y + 10))
+
+        info = [
+            "Enter digits to set the seed",
+            "Enter starts the game",
+            "R rolls a random seed",
+        ]
+        for idx, line in enumerate(info):
+            text = self.small_font.render(line, True, COL_UI_TEXT)
+            self.screen.blit(text, (panel.x + 24, panel.y + 148 + idx * 20))
+
+        self._draw_overlay_button("start", pygame.Rect(panel.x + 24, panel.y + 230, panel.width - 48, 42), "Start Game")
+        self._draw_overlay_button("random_seed", pygame.Rect(panel.x + 24, panel.y + 282, panel.width - 48, 38), "Random Seed")
+        self._draw_overlay_button("quit", pygame.Rect(panel.x + 24, panel.y + 330, panel.width - 48, 34), "Quit")
+
+    def _draw_pause_menu(self):
+        self._draw_overlay_menu(
+            "Paused",
+            "ESC or P resumes the game.",
+            [
+                ("resume", "Resume"),
+                ("restart", "Restart World"),
+                ("main_menu", "Main Menu"),
+                ("quit", "Quit"),
+            ],
+        )
+
+    def _draw_death_menu(self):
+        self._draw_overlay_menu(
+            "You Died",
+            "Press Enter or click restart to try again.",
+            [
+                ("restart", "Restart World"),
+                ("main_menu", "Main Menu"),
+                ("quit", "Quit"),
+            ],
+        )
+
+    def _draw_overlay_menu(self, title, subtitle, buttons):
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((10, 14, 14, 165))
+        self.screen.blit(overlay, (0, 0))
+        panel_h = 150 + len(buttons) * 52
+        panel = pygame.Rect(SCREEN_WIDTH // 2 - 210, SCREEN_HEIGHT // 2 - panel_h // 2, 420, panel_h)
+        self._draw_panel(panel, title)
+        subtitle_text = self.small_font.render(subtitle, True, COL_UI_TEXT)
+        self.screen.blit(subtitle_text, (panel.x + 22, panel.y + 48))
+        for idx, (action, label) in enumerate(buttons):
+            rect = pygame.Rect(panel.x + 24, panel.y + 88 + idx * 52, panel.width - 48, 40)
+            self._draw_overlay_button(action, rect, label)
+
+    def _draw_overlay_button(self, action, rect, label):
+        self.menu_buttons[action] = rect
+        hovered = rect.collidepoint(pygame.mouse.get_pos())
+        fill = COL_UI_SELECTED if hovered else COL_UI_SLOT
+        pygame.draw.rect(self.screen, fill, rect, border_radius=5)
+        pygame.draw.rect(self.screen, COL_UI_BORDER, rect, 2, border_radius=5)
+        text = self.font.render(label, True, COL_WHITE)
+        self.screen.blit(text, (rect.centerx - text.get_width() // 2, rect.centery - text.get_height() // 2))
 
     def _entity_screen_position(self, entity, transform, renderer):
         screen_x = int(transform.x - self.camera_x)
